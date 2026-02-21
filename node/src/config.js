@@ -12,7 +12,7 @@ const cfg = {
   apiKey:       process.env.CAPITAL_API_KEY  || '',
   email:        process.env.CAPITAL_EMAIL    || '',
   password:     process.env.CAPITAL_PASSWORD || '',
-  accountType:  (process.env.ACCOUNT_TYPE   || 'demo').toLowerCase(),
+  accountType:  (process.env.ACCOUNT_TYPE   || 'demo').trim().toLowerCase(),
   swingEnabled:  process.env.SWING_ENABLED === 'true',
 
   // ── Derived base URL ──────────────────────────────────────
@@ -61,7 +61,7 @@ const cfg = {
   SETUP_EXPIRY_BARS_SWING:     12,     // 12 × H1 = 12 hours
 
   // ── Pullback / chop thresholds ────────────────────────────
-  PULLBACK_ATR_TOL:            0.40,   // EMA50 touch zone
+  PULLBACK_ATR_TOL:            0.60,   // EMA50 touch zone (widened from 0.40 for ETHUSD)
   CHOP_EMA_DIST_ATR_MIN:       0.12,   // min EMA spread to avoid chop
   BIG_CANDLE_ATR_MAX:          1.50,   // skip trigger if range > 1.5× ATR
 

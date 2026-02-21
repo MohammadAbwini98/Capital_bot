@@ -15,6 +15,7 @@ const log   = require('./logger');
 // ── Live session tokens ────────────────────────────────────────
 let _cst          = null;
 let _secToken     = null;
+let _accountId    = null;   // currentAccountId returned by POST /session
 let _refreshTimer = null;
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -22,11 +23,16 @@ let _refreshTimer = null;
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function authHeaders() {
-  return {
+  const h = {
     'X-SECURITY-TOKEN': _secToken,
     'CST':              _cst,
     'Content-Type':     'application/json',
   };
+  // Capital.com requires X-CAP-ACCOUNT-ID on all authenticated calls;
+  // without it the server cannot resolve which account to operate on
+  // and returns {"errorCode":"error.null.accountId"}.
+  if (_accountId) h['X-CAP-ACCOUNT-ID'] = _accountId;
+  return h;
 }
 
 function mid({ bid, ask }) {
@@ -108,11 +114,13 @@ async function createSession() {
     );
   }
 
-  _cst      = res.headers['cst'];
-  _secToken = res.headers['x-security-token'];
+  _cst       = res.headers['cst'];
+  _secToken  = res.headers['x-security-token'];
+  _accountId = res.data.currentAccountId ?? null;
 
-  const acct = res.data.accountInfo;
-  log.info(`[API] Session created — account: ${acct?.preferred ?? '?'} | type: ${cfg.accountType.toUpperCase()}`);
+  log.info(
+    `[API] Session created — accountId=${_accountId ?? 'none'} | type: ${cfg.accountType.toUpperCase()}`
+  );
 
   // Auto-refresh before expiry (Capital.com tokens expire after ~10 min)
   clearInterval(_refreshTimer);
@@ -135,7 +143,7 @@ async function destroySession() {
   try {
     await axios.delete(`${cfg.baseUrl}/api/v1/session`, { headers: authHeaders() });
   } catch { /* non-fatal */ }
-  _cst = _secToken = null;
+  _cst = _secToken = _accountId = null;
   log.info('[API] Session destroyed.');
 }
 
