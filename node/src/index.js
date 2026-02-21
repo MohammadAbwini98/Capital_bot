@@ -79,19 +79,39 @@ async function main() {
   log.separator('─');
   log.info('[Main] Starting polling loops...');
 
-  // ── Tick loop: position management every 5 s ──
+  // Fix #6: per-loop busy guards prevent overlapping async executions
+  // when a loop iteration takes longer than its poll interval.
+  let tickBusy  = false;
+  let m5Busy    = false;
+  let m15Busy   = false;
+  let h1Busy    = false;
+  let h4Busy    = false;
+  let reconcBusy = false;
+
+  // ── Tick loop: position management + live price display every 5 s ──
   timers.push(setInterval(async () => {
-    if (shutting) return;
+    if (shutting || tickBusy) return;
+    tickBusy = true;
     try {
       await strategy.managePositions();
     } catch (e) {
       if (!shutting) log.warn(`[Tick] Error: ${e.message}`);
+    } finally {
+      tickBusy = false;
     }
+    // Live in-place price ticker — overwrites same terminal line, not written to log file
+    try {
+      const { bid, ask } = await api.getPrice(cfg.EPIC);
+      const spread = (ask - bid).toFixed(4);
+      const now    = new Date().toISOString().replace('T', ' ').slice(11, 19) + ' UTC';
+      log.live(`${cfg.EPIC}  bid=${bid.toFixed(4)}  ask=${ask.toFixed(4)}  spread=${spread}  ${now}`);
+    } catch { /* non-fatal — skip this tick */ }
   }, cfg.TICK_POLL_MS));
 
   // ── M5 poll: detect candle close every 30 s ──
   timers.push(setInterval(async () => {
-    if (shutting) return;
+    if (shutting || m5Busy) return;
+    m5Busy = true;
     try {
       const newClose = await cs.update('M5');
       if (newClose) {
@@ -100,20 +120,25 @@ async function main() {
       }
     } catch (e) {
       if (!shutting) log.warn(`[M5 Poll] Error: ${e.message}`);
+    } finally {
+      m5Busy = false;
     }
   }, cfg.M5_POLL_MS));
 
   // ── M15 poll: keep trend filter current ──
   timers.push(setInterval(async () => {
-    if (shutting) return;
+    if (shutting || m15Busy) return;
+    m15Busy = true;
     try { await cs.update('M15'); }
     catch (e) { if (!shutting) log.warn(`[M15 Poll] Error: ${e.message}`); }
+    finally { m15Busy = false; }
   }, cfg.M15_POLL_MS));
 
   // ── Swing polls (only when SWING_ENABLED) ──
   if (cfg.swingEnabled) {
     timers.push(setInterval(async () => {
-      if (shutting) return;
+      if (shutting || h1Busy) return;
+      h1Busy = true;
       try {
         const newClose = await cs.update('H1');
         if (newClose) {
@@ -122,15 +147,30 @@ async function main() {
         }
       } catch (e) {
         if (!shutting) log.warn(`[H1 Poll] Error: ${e.message}`);
+      } finally {
+        h1Busy = false;
       }
     }, cfg.H1_POLL_MS));
 
     timers.push(setInterval(async () => {
-      if (shutting) return;
+      if (shutting || h4Busy) return;
+      h4Busy = true;
       try { await cs.update('H4'); }
       catch (e) { if (!shutting) log.warn(`[H4 Poll] Error: ${e.message}`); }
+      finally { h4Busy = false; }
     }, cfg.H4_POLL_MS));
   }
+
+  // ── Platform reconciliation every 60 s (Fix #5) ──
+  // Cross-checks bot-tracked positions against Capital.com and removes
+  // any that were closed server-side (SL/TP triggered on platform).
+  timers.push(setInterval(async () => {
+    if (shutting || reconcBusy) return;
+    reconcBusy = true;
+    try { await strategy.reconcilePositions(); }
+    catch (e) { if (!shutting) log.warn(`[Reconcile] Error: ${e.message}`); }
+    finally { reconcBusy = false; }
+  }, 60_000));
 
   // ── Status log every 60 s ──
   timers.push(setInterval(() => {

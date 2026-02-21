@@ -10,13 +10,14 @@ const path = require('path');
 
 // ── ANSI colour codes (terminal only) ─────────────────────────
 const C = {
-  reset: '\x1b[0m',
-  cyan:  '\x1b[36m',
-  yellow:'\x1b[33m',
-  red:   '\x1b[31m',
-  green: '\x1b[32m',
-  gray:  '\x1b[90m',
-  bold:  '\x1b[1m',
+  reset:  '\x1b[0m',
+  cyan:   '\x1b[36m',
+  yellow: '\x1b[33m',
+  red:    '\x1b[31m',
+  green:  '\x1b[32m',
+  gray:   '\x1b[90m',
+  bold:   '\x1b[1m',
+  white:  '\x1b[97m',
 };
 
 // ── Log directory ──────────────────────────────────────────────
@@ -37,21 +38,32 @@ function ts() {
   return new Date().toISOString().replace('T', ' ').slice(0, 23) + ' UTC';
 }
 
+// ── Live line state ────────────────────────────────────────────
+// Tracks whether the current terminal line is a live (no-newline) price ticker.
+// Any normal log call will erase it first so logs stay clean.
+let _liveLine = false;
+
+function _clearLive() {
+  if (_liveLine) {
+    process.stdout.write('\r\x1b[K'); // carriage-return + erase to end of line
+    _liveLine = false;
+  }
+}
+
 // ── Core emit ──────────────────────────────────────────────────
 function emit(color, level, args) {
   const msg       = args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
   const timestamp = ts();
   const padded    = level.padEnd(5);
 
+  // If the live ticker is on the current line, wipe it first
+  _clearLive();
+
   // Terminal — coloured
   process.stdout.write(`${color}[${timestamp}] [${padded}]${C.reset} ${msg}\n`);
 
-  // File — plain text (no ANSI escape codes)
-  try {
-    fs.appendFileSync(logFilePath(), `[${timestamp}] [${padded}] ${msg}\n`);
-  } catch {
-    // Non-fatal: keep running even if the disk write fails
-  }
+  // File — plain text, async so it never blocks the event loop
+  fs.appendFile(logFilePath(), `[${timestamp}] [${padded}] ${msg}\n`, () => {});
 }
 
 module.exports = {
@@ -64,5 +76,17 @@ module.exports = {
   /** Write a plain separator line — useful for session start / daily reset. */
   separator: (char = '─', width = 54) => {
     emit(C.gray, 'INFO', [char.repeat(width)]);
+  },
+
+  /**
+   * Write a live in-place price ticker on the current terminal line.
+   * Uses \r to overwrite itself every call — no newline, no log file entry.
+   * Any subsequent normal log() call automatically clears this line first.
+   *
+   * @param {string} text  The text to display (keep it short — one line)
+   */
+  live: (text) => {
+    process.stdout.write(`\r\x1b[K${C.gray}◉ ${C.white}${text}${C.reset}`);
+    _liveLine = true;
   },
 };

@@ -4,9 +4,10 @@
 // + BOS strategy as defined in the algorithm spec.
 //
 // Entry points called by index.js polling loops:
-//   onM5Close()        — run on every M5 candle close (scalp)
-//   onH1Close()        — run on every H1 candle close (swing)
-//   managePositions()  — run on every tick cycle
+//   onM5Close()            — run on every M5 candle close (scalp)
+//   onH1Close()            — run on every H1 candle close (swing)
+//   managePositions()      — run on every tick cycle
+//   reconcilePositions()   — run periodically to sync with platform
 // ==============================================================
 
 const cfg      = require('./config');
@@ -23,6 +24,17 @@ const closes = c => c.map(b => b.close);
 const highs  = c => c.map(b => b.high);
 const lows   = c => c.map(b => b.low);
 const last   = c => c[c.length - 1];
+
+// ── PnL helper: prefer broker-reported profit, fall back to math ──
+
+function resolvePnl(confirmed, direction, entry, exitPrice, size) {
+  if (confirmed && typeof confirmed.profit === 'number') {
+    return confirmed.profit;
+  }
+  return direction === 'BUY'
+    ? (exitPrice - entry) * size
+    : (entry - exitPrice) * size;
+}
 
 // ══════════════════════════════════════════════════════════════
 // Market status check
@@ -139,34 +151,62 @@ function chopFilter(tf) {
 /**
  * Attempts to create a new setup on candle close.
  * Returns { active: true, ... } on success, { active: false } otherwise.
+ *
+ * Fix #7: Added EMA alignment check (EMA20 must be aligned with trend)
+ *         and rejection candle (bar must close in the trend direction).
  */
 function createSetup(tf, trend) {
   const candles = cs.get(tf);
   if (candles.length < cfg.EMA_PULLBACK_PERIOD) return { active: false };
 
+  const ema20  = ind.ema(closes(candles), cfg.EMA_FAST_PERIOD);
   const ema50  = ind.ema(closes(candles), cfg.EMA_PULLBACK_PERIOD);
   const atrVal = ind.atr(highs(candles), lows(candles), closes(candles), cfg.ATR_PERIOD);
-  if (ema50 === null || atrVal === null) return { active: false };
+  if (ema20 === null || ema50 === null || atrVal === null) return { active: false };
 
   const bar = last(candles);
   const tol = cfg.PULLBACK_ATR_TOL * atrVal;
 
   if (trend === 'UP') {
-    const dist = Math.abs(bar.low - ema50);
-    if (dist <= tol) {
-      log.info(`[Setup] BUY setup on ${tf}: low=${bar.low.toFixed(4)} ema50=${ema50.toFixed(4)} dist=${dist.toFixed(4)} tol=${tol.toFixed(4)}`);
-      return { active: true, direction: 'BUY', createdTime: bar.time, pullbackExtreme: bar.low };
+    // EMA alignment: EMA20 must be above EMA50 to confirm uptrend structure
+    if (ema20 <= ema50) {
+      log.debug(`[Setup] ${tf}: BUY EMA alignment fail — ema20=${ema20.toFixed(4)} ≤ ema50=${ema50.toFixed(4)}`);
+      return { active: false };
     }
-    log.debug(`[Setup] ${tf}: BUY setup not formed — low=${bar.low.toFixed(4)} too far from ema50=${ema50.toFixed(4)} (dist=${dist.toFixed(4)} tol=${tol.toFixed(4)})`);
+    // Proximity to EMA50
+    const dist = Math.abs(bar.low - ema50);
+    if (dist > tol) {
+      log.debug(`[Setup] ${tf}: BUY not formed — low=${bar.low.toFixed(4)} too far from ema50=${ema50.toFixed(4)} (dist=${dist.toFixed(4)} tol=${tol.toFixed(4)})`);
+      return { active: false };
+    }
+    // Rejection candle: must close bullish (price rejected the EMA50 and closed back up)
+    if (bar.close <= bar.open) {
+      log.debug(`[Setup] ${tf}: BUY no rejection candle — bar bearish (close=${bar.close.toFixed(4)} open=${bar.open.toFixed(4)})`);
+      return { active: false };
+    }
+    log.info(`[Setup] BUY setup on ${tf}: low=${bar.low.toFixed(4)} ema50=${ema50.toFixed(4)} dist=${dist.toFixed(4)} tol=${tol.toFixed(4)}`);
+    return { active: true, direction: 'BUY', createdTime: bar.time, pullbackExtreme: bar.low };
   }
 
   if (trend === 'DOWN') {
-    const dist = Math.abs(bar.high - ema50);
-    if (dist <= tol) {
-      log.info(`[Setup] SELL setup on ${tf}: high=${bar.high.toFixed(4)} ema50=${ema50.toFixed(4)} dist=${dist.toFixed(4)} tol=${tol.toFixed(4)}`);
-      return { active: true, direction: 'SELL', createdTime: bar.time, pullbackExtreme: bar.high };
+    // EMA alignment: EMA20 must be below EMA50 to confirm downtrend structure
+    if (ema20 >= ema50) {
+      log.debug(`[Setup] ${tf}: SELL EMA alignment fail — ema20=${ema20.toFixed(4)} ≥ ema50=${ema50.toFixed(4)}`);
+      return { active: false };
     }
-    log.debug(`[Setup] ${tf}: SELL setup not formed — high=${bar.high.toFixed(4)} too far from ema50=${ema50.toFixed(4)} (dist=${dist.toFixed(4)} tol=${tol.toFixed(4)})`);
+    // Proximity to EMA50
+    const dist = Math.abs(bar.high - ema50);
+    if (dist > tol) {
+      log.debug(`[Setup] ${tf}: SELL not formed — high=${bar.high.toFixed(4)} too far from ema50=${ema50.toFixed(4)} (dist=${dist.toFixed(4)} tol=${tol.toFixed(4)})`);
+      return { active: false };
+    }
+    // Rejection candle: must close bearish (price rejected the EMA50 and closed back down)
+    if (bar.close >= bar.open) {
+      log.debug(`[Setup] ${tf}: SELL no rejection candle — bar bullish (close=${bar.close.toFixed(4)} open=${bar.open.toFixed(4)})`);
+      return { active: false };
+    }
+    log.info(`[Setup] SELL setup on ${tf}: high=${bar.high.toFixed(4)} ema50=${ema50.toFixed(4)} dist=${dist.toFixed(4)} tol=${tol.toFixed(4)}`);
+    return { active: true, direction: 'SELL', createdTime: bar.time, pullbackExtreme: bar.high };
   }
 
   return { active: false };
@@ -212,8 +252,16 @@ function setupExpired(tf, setup, expiryBars) {
 /**
  * Returns true if the most recent closed candle breaks the
  * highest-high / lowest-low of the previous bosLookback candles.
+ *
+ * Fix #7: Added BOS margin = max(spread, 0.05×ATR) to require a
+ *         meaningful close beyond the structure level, not just a tick.
+ *
+ * @param {string} tf
+ * @param {object} setup
+ * @param {number} bosLookback
+ * @param {number} spread  Current bid-ask spread (passed from caller)
  */
-function triggerBOS(tf, setup, bosLookback) {
+function triggerBOS(tf, setup, bosLookback, spread = 0) {
   const candles = cs.get(tf);
   if (candles.length < bosLookback + 1) return false;
 
@@ -230,22 +278,25 @@ function triggerBOS(tf, setup, bosLookback) {
   const prevCandles = candles.slice(0, -1);
   if (prevCandles.length < bosLookback) return false;
 
+  // BOS margin: require close to clear the level by at least max(spread, 5% of ATR)
+  const margin = Math.max(spread, 0.05 * atrVal);
+
   if (setup.direction === 'BUY') {
     const level     = ind.highestHigh(highs(prevCandles), bosLookback);
-    const triggered = bar.close > level;
+    const triggered = bar.close > level + margin;
     if (triggered) {
-      log.info(`[BOS] BUY triggered on ${tf}: close=${bar.close.toFixed(4)} > HH=${level.toFixed(4)}`);
+      log.info(`[BOS] BUY triggered on ${tf}: close=${bar.close.toFixed(4)} > HH=${level.toFixed(4)} + margin=${margin.toFixed(4)}`);
     } else {
-      log.debug(`[BOS] ${tf}: BUY not triggered — close=${bar.close.toFixed(4)} vs HH=${level.toFixed(4)} (need +${(level - bar.close).toFixed(4)} more)`);
+      log.debug(`[BOS] ${tf}: BUY not triggered — close=${bar.close.toFixed(4)} vs HH+margin=${(level + margin).toFixed(4)} (need +${(level + margin - bar.close).toFixed(4)} more)`);
     }
     return triggered;
   } else {
     const level     = ind.lowestLow(lows(prevCandles), bosLookback);
-    const triggered = bar.close < level;
+    const triggered = bar.close < level - margin;
     if (triggered) {
-      log.info(`[BOS] SELL triggered on ${tf}: close=${bar.close.toFixed(4)} < LL=${level.toFixed(4)}`);
+      log.info(`[BOS] SELL triggered on ${tf}: close=${bar.close.toFixed(4)} < LL=${level.toFixed(4)} - margin=${margin.toFixed(4)}`);
     } else {
-      log.debug(`[BOS] ${tf}: SELL not triggered — close=${bar.close.toFixed(4)} vs LL=${level.toFixed(4)} (need -${(bar.close - level).toFixed(4)} more)`);
+      log.debug(`[BOS] ${tf}: SELL not triggered — close=${bar.close.toFixed(4)} vs LL-margin=${(level - margin).toFixed(4)} (need -${(bar.close - (level - margin)).toFixed(4)} more)`);
     }
     return triggered;
   }
@@ -294,6 +345,16 @@ async function placeOrder(mode, setup, bid, ask) {
   const entry = setup.direction === 'BUY' ? ask : bid;
 
   const { sl, tp1, tp2 } = computeSLTP(tf, setup, entry, tp2R);
+
+  // Fix #7: ATR/spread sanity — TP1 must be meaningful relative to the spread
+  const spread   = ask - bid;
+  const tp1Dist  = Math.abs(tp1 - entry);
+  if (tp1Dist < 2 * spread) {
+    log.warn(
+      `[Order] TP1 distance too small (${tp1Dist.toFixed(4)} < 2×spread ${(2 * spread).toFixed(4)}) — trade skipped`
+    );
+    return;
+  }
 
   log.trade(
     `[Order] ${mode} ${setup.direction} | size=${size} | entry=${entry.toFixed(4)} ` +
@@ -377,13 +438,14 @@ async function managePositions() {
 
     if (slHit) {
       log.trade(`[Manage] SL hit — ${pos.direction} dealId=${pos.dealId} exit=${exitPrice.toFixed(4)}`);
-      try { await api.closePosition(pos.dealId); } catch (e) {
+      let confirmed;
+      try { confirmed = await api.closePosition(pos.dealId); } catch (e) {
         log.warn(`[Manage] Close failed (may already be closed by platform): ${e.message}`);
       }
-      const pnl = pos.direction === 'BUY'
-        ? (exitPrice - pos.entry) * pos.size
-        : (pos.entry - exitPrice) * pos.size;
-      state.updatePnL(pnl, true);
+      // Fix #2: use broker-reported profit when available
+      // Fix #3: mark as loss only when PnL is actually negative
+      const pnl = resolvePnl(confirmed, pos.direction, pos.entry, exitPrice, pos.size);
+      state.updatePnL(pnl, pnl < 0);
       state.removePosition(pos.dealId);
       telegram.notifyTradeClosed({
         event: 'SL_HIT', direction: pos.direction, epic: cfg.EPIC,
@@ -392,7 +454,7 @@ async function managePositions() {
       continue;
     }
 
-    // ── TP1 hit (50% partial close) ────────────────────────
+    // ── TP1 hit ────────────────────────────────────────────
     if (!pos.tp1Done) {
       const tp1Hit =
         (pos.direction === 'BUY'  && exitPrice >= pos.tp1) ||
@@ -401,16 +463,41 @@ async function managePositions() {
       if (tp1Hit) {
         log.trade(`[Manage] TP1 hit — ${pos.direction} dealId=${pos.dealId} exit=${exitPrice.toFixed(4)}`);
 
+        // Fix #1: when size=1 (or closeSize rounds to 0) skip partial close,
+        // just mark tp1Done and optionally move SL to breakeven.
+        const closeSize = Math.floor(pos.size * cfg.PARTIAL_CLOSE_TP1);
+
+        if (closeSize < 1) {
+          const newSL = cfg.MOVE_SL_TO_BREAKEVEN_ON_TP1 ? pos.entry : pos.sl;
+          log.trade(
+            `[Manage] TP1 hit (size=${pos.size} — no partial) — marking tp1Done` +
+            (cfg.MOVE_SL_TO_BREAKEVEN_ON_TP1 ? ', moving SL to breakeven' : '')
+          );
+          if (cfg.MOVE_SL_TO_BREAKEVEN_ON_TP1) {
+            try {
+              await api.updatePosition(pos.dealId, { stopLevel: newSL });
+              log.debug(`[Manage] SL updated to breakeven: ${newSL.toFixed(4)}`);
+            } catch (e) {
+              log.warn(`[Manage] SL BE update failed: ${e.message}`);
+            }
+          }
+          state.replacePosition(pos.dealId, { ...pos, tp1Done: true, sl: newSL });
+          telegram.notifyTradeClosed({
+            event: 'TP1_HIT', direction: pos.direction, epic: cfg.EPIC,
+            mode: pos.mode, entry: pos.entry, exitPrice, pnl: 0, dealId: pos.dealId,
+          }).catch(() => {});
+          continue;
+        }
+
+        // Size >= 2: partial close + reopen remainder
         try {
-          await api.closePosition(pos.dealId);
+          const confirmed    = await api.closePosition(pos.dealId);
+          const remainingSize = pos.size - closeSize;
 
-          const halfSize      = Math.max(1, Math.floor(pos.size * cfg.PARTIAL_CLOSE_TP1));
-          const remainingSize = pos.size - halfSize;
-
-          const pnl1 = pos.direction === 'BUY'
-            ? (exitPrice - pos.entry) * halfSize
-            : (pos.entry - exitPrice) * halfSize;
-          state.updatePnL(pnl1, false);
+          // Fix #2: prefer broker profit, scaled to closed portion
+          const pnl1 = resolvePnl(confirmed, pos.direction, pos.entry, exitPrice, closeSize);
+          // Fix #3: partial close at TP1 is rarely a loss, but use actual sign
+          state.updatePnL(pnl1, pnl1 < 0);
           telegram.notifyTradeClosed({
             event: 'TP1_HIT', direction: pos.direction, epic: cfg.EPIC,
             mode: pos.mode, entry: pos.entry, exitPrice, pnl: pnl1, dealId: pos.dealId,
@@ -418,7 +505,7 @@ async function managePositions() {
 
           if (remainingSize >= 1) {
             const newSL = cfg.MOVE_SL_TO_BREAKEVEN_ON_TP1 ? pos.entry : pos.sl;
-            log.debug(`[Manage] Reopening ${remainingSize} unit(s) at breakeven SL=${newSL.toFixed(4)}`);
+            log.debug(`[Manage] Reopening ${remainingSize} unit(s) | SL=${newSL.toFixed(4)}`);
             const { dealId: newDealId, dealReference: newRef } = await api.createPosition({
               epic:        cfg.EPIC,
               direction:   pos.direction,
@@ -428,12 +515,12 @@ async function managePositions() {
             });
             state.replacePosition(pos.dealId, {
               ...pos,
-              dealId:       newDealId,
+              dealId:        newDealId,
               dealReference: newRef,
-              size:         remainingSize,
-              entry:        exitPrice,
-              sl:           newSL,
-              tp1Done:      true,
+              size:          remainingSize,
+              entry:         exitPrice,
+              sl:            newSL,
+              tp1Done:       true,
             });
             log.trade(`[Manage] Remaining ${remainingSize} unit(s) reopened → dealId=${newDealId}`);
           } else {
@@ -454,17 +541,65 @@ async function managePositions() {
 
     if (tp2Hit) {
       log.trade(`[Manage] TP2 hit — ${pos.direction} dealId=${pos.dealId} exit=${exitPrice.toFixed(4)}`);
-      try { await api.closePosition(pos.dealId); } catch (e) {
+      let confirmed;
+      try { confirmed = await api.closePosition(pos.dealId); } catch (e) {
         log.warn(`[Manage] TP2 close failed (may already be closed by platform): ${e.message}`);
       }
-      const pnl = pos.direction === 'BUY'
-        ? (exitPrice - pos.entry) * pos.size
-        : (pos.entry - exitPrice) * pos.size;
-      state.updatePnL(pnl, false);
+      // Fix #2: prefer broker profit; Fix #3: use actual sign
+      const pnl = resolvePnl(confirmed, pos.direction, pos.entry, exitPrice, pos.size);
+      state.updatePnL(pnl, pnl < 0);
       state.removePosition(pos.dealId);
       telegram.notifyTradeClosed({
         event: 'TP2_HIT', direction: pos.direction, epic: cfg.EPIC,
         mode: pos.mode, entry: pos.entry, exitPrice, pnl, dealId: pos.dealId,
+      }).catch(() => {});
+    }
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
+// Platform reconciliation
+// ══════════════════════════════════════════════════════════════
+
+/**
+ * Fix #5: Cross-check bot-tracked positions against the platform.
+ * Any dealId no longer found on Capital.com is treated as broker-closed
+ * (hit SL or TP2 server-side, or margin call) and removed from local state.
+ * Call this every ~60 s from index.js.
+ */
+async function reconcilePositions() {
+  const botPositions = state.getPositions();
+  if (!botPositions.length) return;
+
+  let platformPositions;
+  try {
+    platformPositions = await api.getPositions();
+  } catch (e) {
+    log.warn(`[Reconcile] Failed to fetch platform positions: ${e.message}`);
+    return;
+  }
+
+  // Capital.com wraps each entry as { position: { dealId, ... }, market: {...} }
+  const platformIds = new Set(
+    platformPositions.map(p => p.position?.dealId).filter(Boolean)
+  );
+
+  for (const pos of [...botPositions]) {
+    if (!platformIds.has(pos.dealId)) {
+      log.warn(
+        `[Reconcile] dealId=${pos.dealId} not on platform — ` +
+        `assuming broker-closed (SL/TP/margin). Removing from tracking.`
+      );
+      state.removePosition(pos.dealId);
+      telegram.notifyTradeClosed({
+        event:      'BROKER_CLOSE',
+        direction:  pos.direction,
+        epic:       cfg.EPIC,
+        mode:       pos.mode,
+        entry:      pos.entry,
+        exitPrice:  null,
+        pnl:        null,
+        dealId:     pos.dealId,
       }).catch(() => {});
     }
   }
@@ -506,6 +641,14 @@ async function onM5Close() {
   const setup = state.getSetupScalp();
 
   if (setup.active) {
+    // Fix #4: cancel setup if the trend has flipped since setup was created
+    const expectedTrend = setup.direction === 'BUY' ? 'UP' : 'DOWN';
+    if (trend !== expectedTrend) {
+      log.info(`[M5] Trend changed to ${trend} — invalidating ${setup.direction} scalp setup`);
+      state.setSetupScalp({ active: false });
+      return;
+    }
+
     if (setupExpired('M5', setup, cfg.SETUP_EXPIRY_BARS_SCALP)) {
       log.info('[M5] Setup expired — resetting');
       state.setSetupScalp({ active: false });
@@ -514,7 +657,8 @@ async function onM5Close() {
 
     updateSetupExtreme('M5', setup);
 
-    if (triggerBOS('M5', setup, cfg.BOS_LOOKBACK_SCALP)) {
+    // Pass spread so BOS margin check uses live spread (Fix #7)
+    if (triggerBOS('M5', setup, cfg.BOS_LOOKBACK_SCALP, ask - bid)) {
       await placeOrder('SCALP', setup, bid, ask);
       state.setSetupScalp({ active: false });
     }
@@ -556,6 +700,14 @@ async function onH1Close() {
   const setup = state.getSetupSwing();
 
   if (setup.active) {
+    // Fix #4: cancel setup if the trend has flipped since setup was created
+    const expectedTrend = setup.direction === 'BUY' ? 'UP' : 'DOWN';
+    if (trend !== expectedTrend) {
+      log.info(`[H1] Trend changed to ${trend} — invalidating ${setup.direction} swing setup`);
+      state.setSetupSwing({ active: false });
+      return;
+    }
+
     if (setupExpired('H1', setup, cfg.SETUP_EXPIRY_BARS_SWING)) {
       log.info('[H1] Swing setup expired — resetting');
       state.setSetupSwing({ active: false });
@@ -564,7 +716,8 @@ async function onH1Close() {
 
     updateSetupExtreme('H1', setup);
 
-    if (triggerBOS('H1', setup, cfg.BOS_LOOKBACK_SWING)) {
+    // Pass spread so BOS margin check uses live spread (Fix #7)
+    if (triggerBOS('H1', setup, cfg.BOS_LOOKBACK_SWING, ask - bid)) {
       await placeOrder('SWING', setup, bid, ask);
       state.setSetupSwing({ active: false });
     }
@@ -573,4 +726,4 @@ async function onH1Close() {
   }
 }
 
-module.exports = { onM5Close, onH1Close, managePositions };
+module.exports = { onM5Close, onH1Close, managePositions, reconcilePositions };

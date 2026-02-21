@@ -72,13 +72,14 @@ async function update(tf) {
   const hadNewClose = newest.time > lastClosedTime[tf];
 
   if (hadNewClose) {
-    // Merge new bars that we have not seen yet
-    const known = new Set(store[tf].map(c => c.time));
+    // Append bars with timestamps newer than the last known closed bar.
+    // No Set needed: bars arrive in chronological order and lastClosedTime
+    // is the boundary — anything after it is genuinely new.
+    const oldLastTime = lastClosedTime[tf];
     let added = 0;
     for (const bar of closed) {
-      if (!known.has(bar.time)) {
+      if (bar.time > oldLastTime) {
         store[tf].push(bar);
-        known.add(bar.time);
         added++;
       }
     }
