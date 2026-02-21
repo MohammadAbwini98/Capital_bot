@@ -118,8 +118,36 @@ async function createSession() {
   _secToken  = res.headers['x-security-token'];
   _accountId = res.data.currentAccountId ?? null;
 
+  // Log all available accounts so the user can identify their demo account ID
+  const accounts = res.data.accounts || [];
+  if (accounts.length > 1) {
+    log.debug('[API] Available accounts:');
+    for (const a of accounts) {
+      log.debug(`[API]   id=${a.accountId}  name=${a.accountName}  preferred=${a.preferred}  balance=${a.balance?.available}`);
+    }
+  }
+
+  // Switch to the configured account (e.g. a demo account) if it differs
+  if (cfg.accountId && cfg.accountId !== _accountId) {
+    try {
+      log.info(`[API] Switching account: ${_accountId} → ${cfg.accountId}...`);
+      const switchRes = await axios.put(
+        `${cfg.baseUrl}/api/v1/session/account/${cfg.accountId}`,
+        {},
+        { headers: authHeaders() }
+      );
+      // Capital.com issues new tokens after an account switch
+      if (switchRes.headers['cst'])              _cst       = switchRes.headers['cst'];
+      if (switchRes.headers['x-security-token']) _secToken  = switchRes.headers['x-security-token'];
+      _accountId = cfg.accountId;
+      log.info(`[API] Account switched to: ${_accountId}`);
+    } catch (e) {
+      log.warn(`[API] Account switch failed (will use default): ${e.message}`);
+    }
+  }
+
   log.info(
-    `[API] Session created — accountId=${_accountId ?? 'none'} | type: ${cfg.accountType.toUpperCase()}`
+    `[API] Session ready — accountId=${_accountId ?? 'none'} | type: ${cfg.accountType.toUpperCase()}`
   );
 
   // Auto-refresh before expiry (Capital.com tokens expire after ~10 min)

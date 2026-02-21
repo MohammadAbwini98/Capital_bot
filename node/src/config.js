@@ -15,12 +15,17 @@ const cfg = {
   accountType:  (process.env.ACCOUNT_TYPE   || 'demo').trim().toLowerCase(),
   swingEnabled:  process.env.SWING_ENABLED === 'true',
 
-  // ── Derived base URL ──────────────────────────────────────
-  get baseUrl() {
-    return this.accountType === 'live'
-      ? 'https://api-capital.backend-capital.com'
-      : 'https://demo-api-capital.backend-capital.com';
-  },
+  // ── API base URL ──────────────────────────────────────────
+  // Capital.com's demo accounts created within a live profile are
+  // accessed via the live API endpoint + account switching.
+  // The demo-api endpoint is only for demo.capital.com-only registrations.
+  baseUrl: 'https://api-capital.backend-capital.com',
+
+  // ── Target account ID (optional) ──────────────────────────
+  // Leave blank to use the current preferred account.
+  // Set to your demo account ID when ACCOUNT_TYPE=demo.
+  // Example: CAPITAL_ACCOUNT_ID=310891246381248798
+  accountId: process.env.CAPITAL_ACCOUNT_ID || '',
 
   // ── Instrument ────────────────────────────────────────────
   // Set INSTRUMENT in .env — use Capital.com epic names:
