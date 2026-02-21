@@ -106,7 +106,7 @@ async function createSession() {
   } catch (err) {
     const body = err.response?.data;
     const hint = cfg.accountType === 'demo'
-      ? ' (demo accounts need a separate API key generated from demo.capital.com → Settings → API Integrations)'
+      ? ' (to use demo mode: open Capital.com app → account switcher → Add account → Demo)'
       : '';
     throw new Error(
       `Authentication failed [${err.response?.status}]${hint}: ` +
