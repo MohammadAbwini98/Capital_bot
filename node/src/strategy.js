@@ -57,20 +57,6 @@ async function fetchMarket() {
 }
 
 // ══════════════════════════════════════════════════════════════
-// F) Spread filter
-// ══════════════════════════════════════════════════════════════
-
-function spreadOK(bid, ask) {
-  const spread = ask - bid;
-  if (spread > cfg.SPREAD_MAX) {
-    log.warn(`[Strategy] Spread too wide: ${spread.toFixed(4)} (max ${cfg.SPREAD_MAX})`);
-    return false;
-  }
-  log.debug(`[Strategy] Spread OK: ${spread.toFixed(4)} (max ${cfg.SPREAD_MAX})`);
-  return true;
-}
-
-// ══════════════════════════════════════════════════════════════
 // F) Trend filters
 // ══════════════════════════════════════════════════════════════
 
@@ -621,24 +607,33 @@ async function onM5Close() {
 
   if (!tradeable) return;
 
-  log.debug(`[M5] Market: bid=${bid.toFixed(4)} ask=${ask.toFixed(4)} spread=${(ask - bid).toFixed(4)}`);
+  // Pre-compute all gates so we can log a single summary line
+  const spread   = ask - bid;
+  const spreadOk = spread <= cfg.SPREAD_MAX;
+  const trend    = trendFilterM15();
+  const isChop   = chopFilter('M5');
+  const setup    = state.getSetupScalp();
 
-  if (!spreadOK(bid, ask)) return;
+  log.info(
+    `[M5] spread=${spreadOk ? 'OK' : 'WIDE'}(${spread.toFixed(3)}) ` +
+    `trend=${trend} chop=${isChop} ` +
+    `setup=${setup.active ? setup.direction : 'none'}`
+  );
 
-  const trend = trendFilterM15();
+  if (!spreadOk) {
+    log.warn(`[Strategy] Spread too wide: ${spread.toFixed(4)} (max ${cfg.SPREAD_MAX})`);
+    return;
+  }
+
   if (trend === 'NONE') {
-    log.debug('[M5] No M15 trend — resetting scalp setup');
     state.setSetupScalp({ active: false });
     return;
   }
 
-  if (chopFilter('M5')) {
-    log.debug('[M5] Chop detected — skipping');
+  if (isChop) {
     state.setSetupScalp({ active: false });
     return;
   }
-
-  const setup = state.getSetupScalp();
 
   if (setup.active) {
     // Fix #4: cancel setup if the trend has flipped since setup was created
@@ -680,24 +675,33 @@ async function onH1Close() {
 
   if (!tradeable) return;
 
-  log.debug(`[H1] Market: bid=${bid.toFixed(4)} ask=${ask.toFixed(4)} spread=${(ask - bid).toFixed(4)}`);
+  // Pre-compute all gates so we can log a single summary line
+  const spread   = ask - bid;
+  const spreadOk = spread <= cfg.SPREAD_MAX;
+  const trend    = trendFilterH4();
+  const isChop   = chopFilter('H1');
+  const setup    = state.getSetupSwing();
 
-  if (!spreadOK(bid, ask)) return;
+  log.info(
+    `[H1] spread=${spreadOk ? 'OK' : 'WIDE'}(${spread.toFixed(3)}) ` +
+    `trend=${trend} chop=${isChop} ` +
+    `setup=${setup.active ? setup.direction : 'none'}`
+  );
 
-  const trend = trendFilterH4();
+  if (!spreadOk) {
+    log.warn(`[Strategy] Spread too wide: ${spread.toFixed(4)} (max ${cfg.SPREAD_MAX})`);
+    return;
+  }
+
   if (trend === 'NONE') {
-    log.debug('[H1] No H4 trend — resetting swing setup');
     state.setSetupSwing({ active: false });
     return;
   }
 
-  if (chopFilter('H1')) {
-    log.debug('[H1] Chop detected — skipping');
+  if (isChop) {
     state.setSetupSwing({ active: false });
     return;
   }
-
-  const setup = state.getSetupSwing();
 
   if (setup.active) {
     // Fix #4: cancel setup if the trend has flipped since setup was created

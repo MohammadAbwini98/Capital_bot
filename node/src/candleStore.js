@@ -16,6 +16,37 @@ const RESOLUTION = {
   H4:  'HOUR_4',
 };
 
+// Duration of each timeframe in milliseconds
+const TF_MS = {
+  M5:  5  * 60_000,
+  M15: 15 * 60_000,
+  H1:  60 * 60_000,
+  H4:  4  * 60 * 60_000,
+};
+
+/**
+ * Drop the last bar only if it is still forming.
+ *
+ * Capital.com's /prices endpoint may or may not include the current
+ * in-progress bar as the last item — it is not guaranteed by the API.
+ * Always slicing off the last bar permanently falls one candle behind
+ * when the API returns only closed bars (newest.time never advances).
+ *
+ * Fix: compare the last bar's expected close time against Date.now().
+ * If the bar has already closed (with a 1-second cushion), keep it.
+ *
+ * @param {'M5'|'M15'|'H1'|'H4'} tf
+ * @param {object[]} bars
+ * @returns {object[]}
+ */
+function dropInProgress(tf, bars) {
+  if (!bars.length) return bars;
+  const last      = bars[bars.length - 1];
+  const barEndMs  = last.time + TF_MS[tf];
+  const inProgress = Date.now() < barEndMs - 1_000;   // 1 s cushion
+  return inProgress ? bars.slice(0, -1) : bars;
+}
+
 // In-memory candle stores (closed bars only)
 const store = { M5: [], M15: [], H1: [], H4: [] };
 
@@ -42,9 +73,9 @@ async function loadHistory() {
 }
 
 async function fetchFull(tf, max) {
-  // Fetch max+1 so we can drop the current in-progress bar
+  // Fetch max+1 to have enough bars even after dropping the in-progress one
   const bars   = await api.getCandles(cfg.EPIC, RESOLUTION[tf], max + 1);
-  const closed = bars.slice(0, -1);
+  const closed = dropInProgress(tf, bars);
   store[tf]    = closed;
 
   if (closed.length) {
@@ -65,7 +96,7 @@ async function fetchFull(tf, max) {
  */
 async function update(tf) {
   const bars   = await api.getCandles(cfg.EPIC, RESOLUTION[tf], cfg.INCREMENTAL_BARS + 1);
-  const closed = bars.slice(0, -1);   // drop in-progress
+  const closed = dropInProgress(tf, bars);
   if (!closed.length) return false;
 
   const newest      = closed[closed.length - 1];

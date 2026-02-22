@@ -57,7 +57,31 @@ function trueRanges(highs, lows, closes) {
 }
 
 /**
- * Return the most recent ATR value.
+ * Wilder's Smoothed Moving Average (RMA) — the correct smoothing for ATR.
+ * Uses alpha = 1/period (versus EMA's 2/(period+1)), matching TradingView,
+ * MT4/5, and most charting platforms.
+ *
+ * @param {number[]} values
+ * @param {number}   period
+ * @returns {number|null}
+ */
+function wilderRMA(values, period) {
+  if (values.length < period) return null;
+  // Seed with SMA of the first `period` values
+  let rma = 0;
+  for (let i = 0; i < period; i++) rma += values[i];
+  rma /= period;
+  // Apply Wilder smoothing for the rest
+  for (let i = period; i < values.length; i++) {
+    rma = (rma * (period - 1) + values[i]) / period;
+  }
+  return rma;
+}
+
+/**
+ * Return the most recent ATR value using Wilder's RMA smoothing.
+ * This matches the ATR shown in TradingView / MT4 / MT5.
+ *
  * @param {number[]} highs
  * @param {number[]} lows
  * @param {number[]} closes
@@ -65,7 +89,7 @@ function trueRanges(highs, lows, closes) {
  * @returns {number|null}
  */
 function atr(highs, lows, closes, period) {
-  return ema(trueRanges(highs, lows, closes), period);
+  return wilderRMA(trueRanges(highs, lows, closes), period);
 }
 
 /**
