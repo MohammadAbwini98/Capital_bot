@@ -199,7 +199,7 @@ async function getCandles(epic, resolution, max = 200) {
     low:   mid(p.lowPrice),
     close: mid(p.closePrice),
     vol:   p.lastTradedVolume || 0,
-  }));
+  })).sort((a, b) => a.time - b.time);
 }
 
 /**

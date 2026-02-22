@@ -47,6 +47,16 @@ function dropInProgress(tf, bars) {
   return inProgress ? bars.slice(0, -1) : bars;
 }
 
+// Per-TF history depth.
+// M5/M15 use 600 bars: 200 for EMA200 warmup + 400 bars of live context.
+// H1/H4 use cfg.HISTORY_BARS (300 default) — sufficient for EMA200.
+const TF_HISTORY = {
+  M5:  600,
+  M15: 600,
+  H1:  cfg.HISTORY_BARS,
+  H4:  cfg.HISTORY_BARS,
+};
+
 // In-memory candle stores (closed bars only)
 const store = { M5: [], M15: [], H1: [], H4: [] };
 
@@ -62,12 +72,12 @@ function activeTFs() {
 
 /**
  * Fetch full history for all active timeframes at startup.
- * Uses cfg.HISTORY_BARS (≥300) to cover the 200-period EMA warmup.
+ * Uses TF_HISTORY[tf] bars to cover the 200-period EMA warmup.
  */
 async function loadHistory() {
   for (const tf of activeTFs()) {
-    log.info(`[Candles] Loading ${cfg.HISTORY_BARS} bars for ${tf}...`);
-    await fetchFull(tf, cfg.HISTORY_BARS);
+    log.info(`[Candles] Loading ${TF_HISTORY[tf]} bars for ${tf}...`);
+    await fetchFull(tf, TF_HISTORY[tf]);
     await sleep(250);   // light API throttle
   }
 }
@@ -81,8 +91,12 @@ async function fetchFull(tf, max) {
   if (closed.length) {
     lastClosedTime[tf] = closed[closed.length - 1].time;
   }
+  const latestBar = closed[closed.length - 1];
   const latestISO = new Date(lastClosedTime[tf]).toISOString();
-  log.info(`[Candles] ${tf}: ${closed.length} closed bars loaded (latest: ${latestISO})`);
+  log.info(
+    `[Candles] ${tf}: ${closed.length} closed bars loaded` +
+    (latestBar ? ` — last close=${latestBar.close.toFixed(4)} at ${latestISO}` : ` (none)`)
+  );
 }
 
 // ── Incremental update ──────────────────────────────────────────
@@ -115,14 +129,14 @@ async function update(tf) {
       }
     }
 
-    // Trim to HISTORY_BARS to avoid unbounded growth
-    if (store[tf].length > cfg.HISTORY_BARS) {
-      store[tf] = store[tf].slice(-cfg.HISTORY_BARS);
+    // Trim to TF_HISTORY[tf] to avoid unbounded growth
+    if (store[tf].length > TF_HISTORY[tf]) {
+      store[tf] = store[tf].slice(-TF_HISTORY[tf]);
     }
     lastClosedTime[tf] = newest.time;
 
     const latestISO = new Date(newest.time).toISOString();
-    log.debug(`[Candles] ${tf}: ${added} new bar(s) — latest closed at ${latestISO} | store=${store[tf].length} bars`);
+    log.info(`[Candles] ${tf}: ${added} new bar(s) — close=${newest.close.toFixed(4)} at ${latestISO} | store=${store[tf].length}`);
   } else {
     log.debug(`[Candles] ${tf}: no new bar yet (last closed: ${new Date(lastClosedTime[tf]).toISOString()})`);
   }
