@@ -94,12 +94,18 @@ async function notifyTradeOpened(t) {
  * }} t
  */
 async function notifyTradeClosed(t) {
-  const eventEmoji = { SL_HIT: '❌', TP1_HIT: '✅', TP2_HIT: '🏆' };
-  const eventLabel = { SL_HIT: 'Stop Loss Hit', TP1_HIT: 'TP1 Hit (partial close)', TP2_HIT: 'TP2 Hit (full close)' };
+  const eventEmoji = { SL_HIT: '❌', TP1_HIT: '✅', TP2_HIT: '🏆', BROKER_CLOSE: '⚠️' };
+  const eventLabel = {
+    SL_HIT:       'Stop Loss Hit',
+    TP1_HIT:      'TP1 Hit (partial close)',
+    TP2_HIT:      'TP2 Hit (full close)',
+    BROKER_CLOSE: 'Closed by Broker (SL/TP/Margin)',
+  };
 
-  const emoji = eventEmoji[t.event] ?? '⚪';
-  const label = eventLabel[t.event] ?? t.event;
-  const pnlSign = t.pnl >= 0 ? '+' : '';
+  const emoji    = eventEmoji[t.event] ?? '⚪';
+  const label    = eventLabel[t.event] ?? t.event;
+  const exitStr  = t.exitPrice != null ? `<code>${t.exitPrice.toFixed(4)}</code>` : '<i>unknown</i>';
+  const pnlStr   = t.pnl      != null ? `<code>${t.pnl >= 0 ? '+' : ''}$${t.pnl.toFixed(2)}</code>` : '<i>unknown</i>';
 
   const text = [
     `${emoji} <b>GoldBot — ${label}</b>`,
@@ -107,8 +113,8 @@ async function notifyTradeClosed(t) {
     `${t.direction === 'BUY' ? '📈' : '📉'} <b>${t.direction}</b>  |  ${t.epic}  |  ${t.mode}`,
     ``,
     `💰 <b>Entry</b>       <code>${t.entry.toFixed(4)}</code>`,
-    `🚪 <b>Exit</b>        <code>${t.exitPrice.toFixed(4)}</code>`,
-    `💵 <b>P&amp;L</b>         <code>${pnlSign}$${t.pnl.toFixed(2)}</code>`,
+    `🚪 <b>Exit</b>        ${exitStr}`,
+    `💵 <b>P&amp;L</b>         ${pnlStr}`,
     ``,
     `🔖 <code>${t.dealId}</code>`,
     `🕐 ${ts()}`,
