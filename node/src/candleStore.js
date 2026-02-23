@@ -4,9 +4,10 @@
 // Always stores only CLOSED candles (current in-progress excluded).
 // ==============================================================
 
-const api = require('./api');
-const cfg = require('./config');
-const log = require('./logger');
+const api         = require('./api');
+const cfg         = require('./config');
+const log         = require('./logger');
+const candlesRepo = require('./repo/candlesRepo');
 
 // Resolution names used by Capital.com API
 const RESOLUTION = {
@@ -127,13 +128,17 @@ async function update(tf) {
     // No Set needed: bars arrive in chronological order and lastClosedTime
     // is the boundary — anything after it is genuinely new.
     const oldLastTime = lastClosedTime[tf];
-    let added = 0;
+    const addedBars   = [];
+    let   added       = 0;
     for (const bar of closed) {
       if (bar.time > oldLastTime) {
         store[tf].push(bar);
+        addedBars.push(bar);
         added++;
       }
     }
+    // Persist new closed bars to DB (fire-and-forget, non-blocking)
+    candlesRepo.insertCandles(tf, addedBars);
 
     // Trim to TF_HISTORY[tf] to avoid unbounded growth
     if (store[tf].length > TF_HISTORY[tf]) {

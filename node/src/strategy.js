@@ -10,13 +10,16 @@
 //   reconcilePositions()   — run periodically to sync with platform
 // ==============================================================
 
-const cfg      = require('./config');
-const log      = require('./logger');
-const ind      = require('./indicators');
-const cs       = require('./candleStore');
-const state    = require('./state');
-const api      = require('./api');
-const telegram = require('./telegram');
+const cfg         = require('./config');
+const log         = require('./logger');
+const ind         = require('./indicators');
+const cs          = require('./candleStore');
+const state       = require('./state');
+const api         = require('./api');
+const telegram    = require('./telegram');
+const signalsRepo = require('./repo/signalsRepo');
+const tradesRepo  = require('./repo/tradesRepo');
+const mlModel     = require('./mlModel');
 
 // ── Array extractors ───────────────────────────────────────────
 
@@ -362,6 +365,7 @@ async function placeOrder(mode, setup, bid, ask) {
     profitLevel: tp2,
   });
 
+  const openedTime = Date.now();
   state.addPosition({
     mode,
     direction:    setup.direction,
@@ -373,8 +377,20 @@ async function placeOrder(mode, setup, bid, ask) {
     tp1Done:      false,
     dealId,
     dealReference,
-    openedTime:   Date.now(),
+    openedTime,
   });
+
+  tradesRepo.insertTrade({
+    dealId,
+    epic:      cfg.EPIC,
+    openedTs:  openedTime,
+    direction: setup.direction,
+    size,
+    entry,
+    sl,
+    tp2,
+    mode,
+  }).catch(() => {});
 
   log.trade(`[Order] Placed ✓ dealId=${dealId} ref=${dealReference}`);
 
@@ -439,6 +455,7 @@ async function managePositions() {
       const pnl = resolvePnl(confirmed, pos.direction, pos.entry, exitPrice, pos.size);
       state.updatePnL(pnl, pnl < 0);
       state.removePosition(pos.dealId);
+      tradesRepo.closeTrade({ dealId: pos.dealId, closedTs: Date.now(), exit: exitPrice, realizedPnl: pnl, closeReason: 'SL_HIT' }).catch(() => {});
       telegram.notifyTradeClosed({
         event: 'SL_HIT', direction: pos.direction, epic: cfg.EPIC,
         mode: pos.mode, entry: pos.entry, exitPrice, pnl, dealId: pos.dealId,
@@ -490,6 +507,7 @@ async function managePositions() {
           const pnl1 = resolvePnl(confirmed, pos.direction, pos.entry, exitPrice, closeSize);
           // Fix #3: partial close at TP1 is rarely a loss, but use actual sign
           state.updatePnL(pnl1, pnl1 < 0);
+          tradesRepo.closeTrade({ dealId: pos.dealId, closedTs: Date.now(), exit: exitPrice, realizedPnl: pnl1, closeReason: 'TP1_HIT' }).catch(() => {});
           telegram.notifyTradeClosed({
             event: 'TP1_HIT', direction: pos.direction, epic: cfg.EPIC,
             mode: pos.mode, entry: pos.entry, exitPrice, pnl: pnl1, dealId: pos.dealId,
@@ -505,6 +523,7 @@ async function managePositions() {
               stopLevel:   newSL,
               profitLevel: pos.tp2,
             });
+            const reopenedTime = Date.now();
             state.replacePosition(pos.dealId, {
               ...pos,
               dealId:        newDealId,
@@ -513,7 +532,19 @@ async function managePositions() {
               entry:         exitPrice,
               sl:            newSL,
               tp1Done:       true,
+              openedTime:    reopenedTime,
             });
+            tradesRepo.insertTrade({
+              dealId:    newDealId,
+              epic:      cfg.EPIC,
+              openedTs:  reopenedTime,
+              direction: pos.direction,
+              size:      remainingSize,
+              entry:     exitPrice,
+              sl:        newSL,
+              tp2:       pos.tp2,
+              mode:      pos.mode,
+            }).catch(() => {});
             log.trade(`[Manage] Remaining ${remainingSize} unit(s) reopened → dealId=${newDealId}`);
           } else {
             state.removePosition(pos.dealId);
@@ -541,6 +572,7 @@ async function managePositions() {
       const pnl = resolvePnl(confirmed, pos.direction, pos.entry, exitPrice, pos.size);
       state.updatePnL(pnl, pnl < 0);
       state.removePosition(pos.dealId);
+      tradesRepo.closeTrade({ dealId: pos.dealId, closedTs: Date.now(), exit: exitPrice, realizedPnl: pnl, closeReason: 'TP2_HIT' }).catch(() => {});
       telegram.notifyTradeClosed({
         event: 'TP2_HIT', direction: pos.direction, epic: cfg.EPIC,
         mode: pos.mode, entry: pos.entry, exitPrice, pnl, dealId: pos.dealId,
@@ -664,6 +696,7 @@ async function reconcilePositions() {
     }
 
     state.removePosition(pos.dealId);
+    tradesRepo.closeTrade({ dealId: pos.dealId, closedTs: Date.now(), exit: null, realizedPnl: pnl, closeReason: 'BROKER_CLOSE' }).catch(() => {});
     telegram.notifyTradeClosed({
       event:      'BROKER_CLOSE',
       direction:  pos.direction,
@@ -763,74 +796,174 @@ async function syncExistingPositions() {
 
 /**
  * Called on every M5 candle close — runs the SCALP branch.
+ *
+ * Signal logging: a row is written to the `signals` table on every call
+ * (regardless of which gate fires) via a try/finally block.
+ * ML gate: after BOS + M1 micro-confirm, score features against the
+ * loaded JSON model and block the entry if confidence is too low.
  */
 async function onM5Close() {
-  if (!state.riskOK()) return;
+  // Mutable signal context — populated as we proceed through gates.
+  // The finally block always flushes it to the DB.
+  const sig = {
+    epic:         cfg.EPIC,
+    ts:           Date.now(),
+    mode:         'SCALP',
+    action:       'HOLD',
+    reasons:      { riskOK: false },
+    features:     {},
+    modelScore:   null,
+    modelVersion: null,
+  };
 
-  let bid, ask, tradeable;
-  try { ({ bid, ask, tradeable } = await fetchMarket()); }
-  catch (e) { log.error(`[M5] getPrice failed: ${e.message}`); return; }
+  try {
+    if (!state.riskOK()) { sig.action = 'SKIP_RISK'; return; }
+    sig.reasons.riskOK = true;
 
-  if (!tradeable) return;
+    let bid, ask, tradeable;
+    try { ({ bid, ask, tradeable } = await fetchMarket()); }
+    catch (e) { log.error(`[M5] getPrice failed: ${e.message}`); sig.action = 'SKIP_MARKET_ERR'; return; }
 
-  // Pre-compute all gates so we can log a single summary line
-  const spread   = ask - bid;
-  const spreadOk = spread <= cfg.SPREAD_MAX;
-  const trend    = trendFilterM15();
-  const isChop   = chopFilter('M5');
-  const setup    = state.getSetupScalp();
+    if (!tradeable) { sig.action = 'SKIP_MARKET_CLOSED'; return; }
 
-  log.info(
-    `[M5] spread=${spreadOk ? 'OK' : 'WIDE'}(${spread.toFixed(3)}) ` +
-    `trend=${trend} chop=${isChop} ` +
-    `setup=${setup.active ? setup.direction : 'none'}`
-  );
+    // Pre-compute all gates so we can log a single summary line
+    const spread   = ask - bid;
+    const spreadOk = spread <= cfg.SPREAD_MAX;
+    const trend    = trendFilterM15();
+    const isChop   = chopFilter('M5');
+    const setup    = state.getSetupScalp();
 
-  if (!spreadOk) {
-    log.warn(`[Strategy] Spread too wide: ${spread.toFixed(4)} (max ${cfg.SPREAD_MAX})`);
-    return;
-  }
+    log.info(
+      `[M5] spread=${spreadOk ? 'OK' : 'WIDE'}(${spread.toFixed(3)}) ` +
+      `trend=${trend} chop=${isChop} ` +
+      `setup=${setup.active ? setup.direction : 'none'}`
+    );
 
-  if (trend === 'NONE') {
-    state.setSetupScalp({ active: false });
-    return;
-  }
+    // Build feature snapshot for ML training dataset
+    const m5  = cs.get('M5');
+    const m15 = cs.get('M15');
+    const m1  = cs.get('M1');
+    const m5_ema20  = m5.length  >= cfg.EMA_FAST_PERIOD    ? ind.ema(closes(m5),  cfg.EMA_FAST_PERIOD)    : null;
+    const m5_ema50  = m5.length  >= cfg.EMA_PULLBACK_PERIOD ? ind.ema(closes(m5),  cfg.EMA_PULLBACK_PERIOD) : null;
+    const m5_atr    = m5.length  >= cfg.ATR_PERIOD          ? ind.atr(highs(m5),  lows(m5),  closes(m5),  cfg.ATR_PERIOD) : null;
+    const m15_ema200 = m15.length >= cfg.EMA_TREND_PERIOD   ? ind.ema(closes(m15), cfg.EMA_TREND_PERIOD)   : null;
+    const m1_ema20  = m1.length  >= cfg.MICRO_EMA_FAST_PERIOD ? ind.ema(closes(m1), cfg.MICRO_EMA_FAST_PERIOD) : null;
+    const m1_ema50  = m1.length  >= cfg.MICRO_EMA_SLOW_PERIOD ? ind.ema(closes(m1), cfg.MICRO_EMA_SLOW_PERIOD) : null;
+    const m5_close  = m5.length  ? last(m5).close  : null;
+    const m15_close = m15.length ? last(m15).close : null;
 
-  if (isChop) {
-    state.setSetupScalp({ active: false });
-    return;
-  }
+    sig.features = {
+      spread,
+      bid,
+      ask,
+      spread_norm:           m5_atr ? spread / m5_atr : null,
+      m5_close,
+      m5_ema20,
+      m5_ema50,
+      m5_atr,
+      m5_ema20_50_dist_atr:  (m5_ema20 != null && m5_ema50 != null && m5_atr)
+                               ? (m5_ema20 - m5_ema50) / m5_atr : null,
+      m5_close_ema50_dist:   (m5_close != null && m5_ema50 != null)
+                               ? m5_close - m5_ema50 : null,
+      m15_close,
+      m15_ema200,
+      m15_ema200_dist_atr:   (m15_close != null && m15_ema200 != null && m5_atr)
+                               ? (m15_close - m15_ema200) / m5_atr : null,
+      m1_ema20,
+      m1_ema50,
+      m1_ema20_50_dist:      (m1_ema20 != null && m1_ema50 != null)
+                               ? m1_ema20 - m1_ema50 : null,
+      chop:                  isChop ? 1 : 0,
+      setup_active:          setup.active ? 1 : 0,
+    };
 
-  if (setup.active) {
-    // Fix #4: cancel setup if the trend has flipped since setup was created
-    const expectedTrend = setup.direction === 'BUY' ? 'UP' : 'DOWN';
-    if (trend !== expectedTrend) {
-      log.info(`[M5] Trend changed to ${trend} — invalidating ${setup.direction} scalp setup`);
-      state.setSetupScalp({ active: false });
-      return;
+    sig.reasons = {
+      ...sig.reasons,
+      spreadOk,
+      trend,
+      isChop,
+      setupActive:      setup.active,
+      setupDirection:   setup.active ? setup.direction : null,
+    };
+
+    if (!spreadOk) {
+      log.warn(`[Strategy] Spread too wide: ${spread.toFixed(4)} (max ${cfg.SPREAD_MAX})`);
+      sig.action = 'SKIP_SPREAD'; return;
     }
 
-    if (setupExpired('M5', setup, cfg.SETUP_EXPIRY_BARS_SCALP)) {
-      log.info('[M5] Setup expired — resetting');
+    if (trend === 'NONE') {
       state.setSetupScalp({ active: false });
-      return;
+      sig.action = 'SKIP_TREND'; return;
     }
 
-    updateSetupExtreme('M5', setup);
+    if (isChop) {
+      state.setSetupScalp({ active: false });
+      sig.action = 'SKIP_CHOP'; return;
+    }
 
-    // Pass spread so BOS margin check uses live spread (Fix #7)
-    if (triggerBOS('M5', setup, cfg.BOS_LOOKBACK_SCALP, ask - bid)) {
-      // M1 micro-confirmation: require M1 EMA structure to agree with direction
-      if (!microConfirmM1(setup.direction)) {
-        log.info(`[M5] M1 micro-confirm FAIL for ${setup.direction} — entry blocked`);
+    if (setup.active) {
+      const expectedTrend = setup.direction === 'BUY' ? 'UP' : 'DOWN';
+      if (trend !== expectedTrend) {
+        log.info(`[M5] Trend changed to ${trend} — invalidating ${setup.direction} scalp setup`);
         state.setSetupScalp({ active: false });
-        return;
+        sig.action = 'SKIP_TREND_FLIP'; return;
       }
-      await placeOrder('SCALP', setup, bid, ask);
-      state.setSetupScalp({ active: false });
+
+      if (setupExpired('M5', setup, cfg.SETUP_EXPIRY_BARS_SCALP)) {
+        log.info('[M5] Setup expired — resetting');
+        state.setSetupScalp({ active: false });
+        sig.action = 'SKIP_EXPIRED'; return;
+      }
+
+      updateSetupExtreme('M5', setup);
+
+      const bosOk = triggerBOS('M5', setup, cfg.BOS_LOOKBACK_SCALP, spread);
+      sig.reasons.bosTriggered = bosOk;
+      sig.action = setup.direction === 'BUY' ? 'BUY_CANDIDATE' : 'SELL_CANDIDATE';
+
+      if (bosOk) {
+        const m1ok = microConfirmM1(setup.direction);
+        sig.reasons.microConfirmOk = m1ok;
+        if (!m1ok) {
+          log.info(`[M5] M1 micro-confirm FAIL for ${setup.direction} — entry blocked`);
+          state.setSetupScalp({ active: false });
+          sig.action = `${setup.direction}_SKIP_M1`; return;
+        }
+
+        // ML confidence gate (no-op when no model is loaded)
+        const ml = mlModel.score(sig.features);
+        if (ml) {
+          sig.modelScore   = ml.score;
+          sig.modelVersion = ml.version;
+          sig.reasons.mlScore = ml.score;
+
+          const mlBlocked =
+            (setup.direction === 'BUY'  && ml.score < cfg.ML_BUY_THRESHOLD) ||
+            (setup.direction === 'SELL' && ml.score > cfg.ML_SELL_THRESHOLD);
+
+          if (mlBlocked) {
+            log.info(
+              `[M5] ML gate BLOCKED ${setup.direction}: score=${ml.score.toFixed(3)} ` +
+              `(need ${setup.direction === 'BUY' ? '>=' + cfg.ML_BUY_THRESHOLD : '<=' + cfg.ML_SELL_THRESHOLD})`
+            );
+            state.setSetupScalp({ active: false });
+            sig.action = `${setup.direction}_SKIP_ML`; return;
+          }
+          log.debug(`[M5] ML gate PASS ${setup.direction}: score=${ml.score.toFixed(3)} v=${ml.version}`);
+        }
+
+        sig.action = `${setup.direction}_EXEC`;
+        await placeOrder('SCALP', setup, bid, ask);
+        state.setSetupScalp({ active: false });
+      }
+    } else {
+      state.setSetupScalp(createSetup('M5', trend));
+      sig.action = 'SETUP_FORMING';
     }
-  } else {
-    state.setSetupScalp(createSetup('M5', trend));
+
+  } finally {
+    // Always persist the signal row (fire-and-forget)
+    signalsRepo.insertSignal(sig).catch(() => {});
   }
 }
 

@@ -13,6 +13,7 @@ const cfg      = require('./config');
 const log      = require('./logger');
 const ind      = require('./indicators');
 const telegram = require('./telegram');
+const db       = require('./db');
 
 let shutting = false;
 const timers = [];
@@ -55,12 +56,19 @@ async function main() {
   // Telegram startup ping (non-blocking)
   telegram.notifyBotStarted({ epic: cfg.EPIC, accountType: cfg.accountType, equity }).catch(() => {});
 
-  // Step 3: load candle history for all active TFs
+  // Step 3: initialise optional database (non-fatal — bot runs without DB)
+  if (cfg.DB_URL) {
+    await db.init();
+  } else {
+    log.info('[Main] DB_URL not set — running without database (ML logging disabled).');
+  }
+
+  // Step 4: load candle history for all active TFs
   log.info('[Main] Loading candle history...');
   await cs.loadHistory();
   log.info('[Main] Candle history ready.');
 
-  // Step 4: adopt any positions already open on the platform (Bug #6 fix)
+  // Step 5: adopt any positions already open on the platform (Bug #6 fix)
   // TP1 is reconstructed from entry/SL so management works after a restart.
   log.info('[Main] Syncing existing platform positions...');
   await strategy.syncExistingPositions();

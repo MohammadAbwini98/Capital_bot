@@ -118,6 +118,19 @@ const cfg = {
   // Leave blank to disable notifications silently.
   telegramToken:  process.env.TELEGRAM_TOKEN   || '',
   telegramChatId: process.env.TELEGRAM_CHAT_ID || '',
+
+  // ── Database (optional — ML data logging) ─────────────────
+  // Set DB_URL in .env to enable signal/candle/trade persistence.
+  // Leave blank to run without a database (trading is unaffected).
+  // Example: DB_URL=postgresql://user:pass@localhost:5432/goldbot
+  DB_URL: process.env.DB_URL || '',
+
+  // ── ML confidence filter ──────────────────────────────────
+  // Applied after BOS + M1 micro-confirm.  No-op until models/current.json exists.
+  // BUY  entry: require p(up) >= ML_BUY_THRESHOLD
+  // SELL entry: require p(up) <= ML_SELL_THRESHOLD  (= p(down) >= 1 - threshold)
+  ML_BUY_THRESHOLD:  parseFloat(process.env.ML_BUY_THRESHOLD)  || 0.60,
+  ML_SELL_THRESHOLD: parseFloat(process.env.ML_SELL_THRESHOLD) || 0.40,
 };
 
 module.exports = cfg;
