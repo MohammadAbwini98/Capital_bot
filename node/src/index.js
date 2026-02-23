@@ -14,6 +14,7 @@ const log      = require('./logger');
 const ind      = require('./indicators');
 const telegram = require('./telegram');
 const db       = require('./db');
+const trainer  = require('./trainerRunner');
 
 let shutting = false;
 const timers = [];
@@ -280,6 +281,15 @@ function scheduleMidnightReset() {
     } catch { /* non-fatal */ }
     state.dailyReset(eq);
     scheduleMidnightReset();   // reschedule for the next day
+
+    // Run ML training pipeline 30 min after midnight (non-blocking, non-fatal).
+    // Gives candles time to close before labelling + retraining.
+    if (cfg.DB_URL) {
+      setTimeout(() => {
+        if (!shutting) trainer.runNightlyTrainer();
+      }, 30 * 60_000);
+      log.info('[Main] Nightly trainer scheduled in 30 min.');
+    }
   }, msUntilMidnight);
 
   log.info(`[Main] Daily reset scheduled in ${Math.round(msUntilMidnight / 60_000)} min (UTC midnight).`);
