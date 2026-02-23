@@ -127,13 +127,15 @@ async function createSession() {
     }
   }
 
-  // Switch to the configured account (e.g. a demo account) if it differs
+  // Switch to the configured account (e.g. a demo account) if it differs.
+  // Correct endpoint: PUT /api/v1/session with { accountId } in the body.
+  // (NOT /session/account/{id} — that returns 404.)
   if (cfg.accountId && cfg.accountId !== _accountId) {
     try {
       log.info(`[API] Switching account: ${_accountId} → ${cfg.accountId}...`);
       const switchRes = await axios.put(
-        `${cfg.baseUrl}/api/v1/session/account/${cfg.accountId}`,
-        {},
+        `${cfg.baseUrl}/api/v1/session`,
+        { accountId: cfg.accountId },
         { headers: authHeaders() }
       );
       // Capital.com issues new tokens after an account switch
@@ -221,8 +223,10 @@ async function getPrice(epic) {
 // ══════════════════════════════════════════════════════════════
 
 /**
- * Fetch the first (preferred) account details.
- * @returns {{ balance: { available:number } } | null}
+ * Fetch the currently active account details.
+ * Returns the account whose accountId matches the active session account,
+ * falling back to the first account in the list if no match is found.
+ * @returns {{ accountId:string, balance: { available:number } } | null}
  */
 async function getAccount() {
   const res = await axios.get(
@@ -230,7 +234,8 @@ async function getAccount() {
     { headers: authHeaders() }
   );
   const accounts = res.data.accounts || [];
-  return accounts[0] ?? null;
+  // Return the account matching the active session accountId (Bug #2 fix)
+  return accounts.find(a => a.accountId === _accountId) ?? accounts[0] ?? null;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -299,7 +304,11 @@ async function createPosition({ epic, direction, size, stopLevel, profitLevel })
     throw new Error(`No dealId in confirmation: ${JSON.stringify(confirmed)}`);
   }
 
-  log.info(`[API] Deal confirmed: dealId=${dealId} status=ACCEPTED`);
+  const affectedStatuses = (confirmed.affectedDeals || []).map(d => d.status).join(',');
+  log.info(
+    `[API] Deal confirmed: dealId=${dealId} status=${confirmed.dealStatus}` +
+    (affectedStatuses ? ` affectedDeals=[${affectedStatuses}]` : '')
+  );
   return { dealId, dealReference };
 }
 
@@ -327,7 +336,7 @@ async function closePosition(dealId) {
 
   log.debug(`[API] closePosition — dealReference=${dealReference} — awaiting confirmation...`);
   const confirmed = await _confirmDeal(dealReference);
-  log.info(`[API] Close confirmed: dealId=${dealId} status=ACCEPTED`);
+  log.info(`[API] Close confirmed: dealId=${dealId} status=${confirmed.dealStatus}`);
   return confirmed;
 }
 
@@ -349,6 +358,41 @@ async function updatePosition(dealId, { stopLevel, profitLevel } = {}) {
   return res.data;
 }
 
+/**
+ * Fetch a single open position by dealId.
+ * Returns the position object, or null if it no longer exists (404).
+ * Used by reconcilePositions() to confirm a position is truly closed.
+ */
+async function getPosition(dealId) {
+  try {
+    const res = await axios.get(
+      `${cfg.baseUrl}/api/v1/positions/${dealId}`,
+      { headers: authHeaders() }
+    );
+    return res.data ?? null;
+  } catch (e) {
+    if (e.response?.status === 404) return null;
+    throw e;
+  }
+}
+
+/**
+ * Fetch account activity history from a given timestamp.
+ * Used to recover realized PnL for broker-closed positions.
+ *
+ * Capital.com endpoint: GET /api/v1/history/activity
+ * @param {number} fromMs  Start timestamp in milliseconds
+ * @returns {Promise<object[]>} Array of activity records
+ */
+async function getDayActivity(fromMs) {
+  const from = new Date(fromMs).toISOString().replace(/\.\d{3}Z$/, '');
+  const res = await axios.get(
+    `${cfg.baseUrl}/api/v1/history/activity`,
+    { params: { from, detailed: true }, headers: authHeaders() }
+  );
+  return res.data.activities || [];
+}
+
 module.exports = {
   createSession,
   destroySession,
@@ -356,6 +400,8 @@ module.exports = {
   getPrice,
   getAccount,
   getPositions,
+  getPosition,
+  getDayActivity,
   createPosition,
   closePosition,
   updatePosition,

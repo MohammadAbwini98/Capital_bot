@@ -25,6 +25,12 @@ const highs  = c => c.map(b => b.high);
 const lows   = c => c.map(b => b.low);
 const last   = c => c[c.length - 1];
 
+// ── Reconcile miss-count tracking ──────────────────────────────
+// Tracks how many consecutive reconcile cycles each dealId has been
+// absent from the platform's /positions list.  Only after MISS_THRESHOLD
+// consecutive misses do we confirm via a direct single-position GET.
+const _reconcileMissCount = {};
+
 // ── PnL helper: prefer broker-reported profit, fall back to math ──
 
 function resolvePnl(confirmed, direction, entry, exitPrice, size) {
@@ -548,13 +554,30 @@ async function managePositions() {
 // ══════════════════════════════════════════════════════════════
 
 /**
- * Fix #5: Cross-check bot-tracked positions against the platform.
- * Any dealId no longer found on Capital.com is treated as broker-closed
- * (hit SL or TP2 server-side, or margin call) and removed from local state.
+ * Cross-check bot-tracked positions against the platform.
+ *
+ * Safety rules (Bug #4 fix):
+ *  - A single miss from /positions does NOT remove the local position.
+ *    Capital.com can have transient API inconsistencies.
+ *  - After MISS_THRESHOLD consecutive misses, verify via GET /positions/{dealId}.
+ *  - Only a confirmed 404 from the single-position endpoint triggers removal.
+ *
+ * PnL recovery (Bug #5 fix):
+ *  - On confirmed closure, query /history/activity to recover realized PnL
+ *    and update day_pnl / consecutive_losses counters correctly.
+ *
  * Call this every ~60 s from index.js.
  */
 async function reconcilePositions() {
   const botPositions = state.getPositions();
+
+  // Clean up miss counters for positions no longer tracked
+  for (const id of Object.keys(_reconcileMissCount)) {
+    if (!botPositions.find(p => p.dealId === id)) {
+      delete _reconcileMissCount[id];
+    }
+  }
+
   if (!botPositions.length) return;
 
   let platformPositions;
@@ -570,25 +593,168 @@ async function reconcilePositions() {
     platformPositions.map(p => p.position?.dealId).filter(Boolean)
   );
 
+  const MISS_THRESHOLD = 3;
+
   for (const pos of [...botPositions]) {
-    if (!platformIds.has(pos.dealId)) {
-      log.warn(
-        `[Reconcile] dealId=${pos.dealId} not on platform — ` +
-        `assuming broker-closed (SL/TP/margin). Removing from tracking.`
-      );
-      state.removePosition(pos.dealId);
-      telegram.notifyTradeClosed({
-        event:      'BROKER_CLOSE',
-        direction:  pos.direction,
-        epic:       cfg.EPIC,
-        mode:       pos.mode,
-        entry:      pos.entry,
-        exitPrice:  null,
-        pnl:        null,
-        dealId:     pos.dealId,
-      }).catch(() => {});
+    if (platformIds.has(pos.dealId)) {
+      // Position is present — reset any pending miss counter
+      delete _reconcileMissCount[pos.dealId];
+      continue;
     }
+
+    // Position absent from list — increment miss counter
+    _reconcileMissCount[pos.dealId] = (_reconcileMissCount[pos.dealId] || 0) + 1;
+    const misses = _reconcileMissCount[pos.dealId];
+
+    if (misses < MISS_THRESHOLD) {
+      log.warn(
+        `[Reconcile] dealId=${pos.dealId} not in /positions list ` +
+        `(miss ${misses}/${MISS_THRESHOLD}) — waiting for confirmation...`
+      );
+      continue;
+    }
+
+    // MISS_THRESHOLD reached — verify via direct single-position GET
+    let stillOpen;
+    try {
+      stillOpen = await api.getPosition(pos.dealId);
+    } catch (e) {
+      log.warn(`[Reconcile] Could not verify ${pos.dealId}: ${e.message}`);
+      continue;
+    }
+
+    if (stillOpen) {
+      log.warn(
+        `[Reconcile] dealId=${pos.dealId} absent from list but found via direct GET — ` +
+        `resetting miss counter (transient API inconsistency)`
+      );
+      _reconcileMissCount[pos.dealId] = 0;
+      continue;
+    }
+
+    // Confirmed closed — try to recover realized PnL from history (Bug #5)
+    log.warn(
+      `[Reconcile] dealId=${pos.dealId} confirmed not on platform — ` +
+      `broker-closed (SL/TP/margin). Recovering PnL...`
+    );
+    delete _reconcileMissCount[pos.dealId];
+
+    let pnl = null;
+    try {
+      const activities = await api.getDayActivity(pos.openedTime);
+      // Find the POSITION close event matching this dealId
+      const closeEvent = activities.find(a =>
+        a.dealId === pos.dealId &&
+        (a.type?.toLowerCase()   === 'position') &&
+        (a.status?.toLowerCase() === 'closed')
+      );
+      if (closeEvent) {
+        // Capital.com returns profit in details.profit (float, account currency)
+        pnl = closeEvent.details?.profit ?? closeEvent.profit ?? null;
+        log.debug(`[Reconcile] History PnL for ${pos.dealId}: ${pnl}`);
+      } else {
+        log.debug(`[Reconcile] No close event found in history for ${pos.dealId}`);
+      }
+    } catch (e) {
+      log.debug(`[Reconcile] History fetch failed for ${pos.dealId}: ${e.message}`);
+    }
+
+    if (pnl !== null) {
+      state.updatePnL(pnl, pnl < 0);
+    }
+
+    state.removePosition(pos.dealId);
+    telegram.notifyTradeClosed({
+      event:      'BROKER_CLOSE',
+      direction:  pos.direction,
+      epic:       cfg.EPIC,
+      mode:       pos.mode,
+      entry:      pos.entry,
+      exitPrice:  null,
+      pnl,
+      dealId:     pos.dealId,
+    }).catch(() => {});
   }
+}
+
+// ══════════════════════════════════════════════════════════════
+// Startup sync
+// ══════════════════════════════════════════════════════════════
+
+/**
+ * Adopt any positions already open on the platform at startup.
+ * Reconstructs TP1 from entry/SL using the deterministic formula
+ * so TP1 management works correctly after a restart (Bug #6 fix).
+ *
+ * If SL is missing, TP management is disabled for that position to
+ * prevent null-comparison false-triggers.
+ */
+async function syncExistingPositions() {
+  let platformPositions;
+  try {
+    platformPositions = await api.getPositions();
+  } catch (e) {
+    log.warn(`[Sync] Could not fetch platform positions: ${e.message}`);
+    return;
+  }
+
+  if (!platformPositions.length) {
+    log.info('[Sync] No existing platform positions to adopt.');
+    return;
+  }
+
+  let adopted = 0;
+  for (const p of platformPositions) {
+    const pos  = p.position;
+    const entry = pos.level;
+    const sl    = pos.stopLevel ?? null;
+    const tp2   = pos.limitLevel ?? null;
+    const dir   = pos.direction;  // 'BUY' or 'SELL'
+
+    if (!entry || !sl) {
+      // Without entry + SL we cannot compute R — disable TP logic safely
+      log.warn(
+        `[Sync] Skipping dealId=${pos.dealId} — missing entry(${entry}) or sl(${sl}). ` +
+        `Position will be managed by platform SL/TP only.`
+      );
+      continue;
+    }
+
+    const R   = Math.abs(entry - sl);
+    const tp1 = dir === 'BUY'
+      ? entry + cfg.TP1_R * R
+      : entry - cfg.TP1_R * R;
+
+    // If platform TP2 is absent, compute a synthetic one from the scalp R
+    const tp2Final = tp2 ?? (
+      dir === 'BUY'
+        ? entry + cfg.TP2_R_SCALP * R
+        : entry - cfg.TP2_R_SCALP * R
+    );
+
+    state.adoptPosition({
+      mode:          'UNKNOWN',
+      direction:     dir,
+      size:          pos.size,
+      entry,
+      sl,
+      tp1,
+      tp2:           tp2Final,
+      tp1Done:       false,
+      dealId:        pos.dealId,
+      dealReference: pos.dealReference ?? '',
+      openedTime:    Date.now(),
+    });
+
+    log.info(
+      `[Sync] Adopted ${dir} dealId=${pos.dealId} | ` +
+      `entry=${entry.toFixed(4)} sl=${sl.toFixed(4)} ` +
+      `tp1=${tp1.toFixed(4)} tp2=${tp2Final.toFixed(4)}`
+    );
+    adopted++;
+  }
+
+  if (adopted) log.info(`[Sync] Adopted ${adopted} existing platform position(s).`);
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -654,6 +820,12 @@ async function onM5Close() {
 
     // Pass spread so BOS margin check uses live spread (Fix #7)
     if (triggerBOS('M5', setup, cfg.BOS_LOOKBACK_SCALP, ask - bid)) {
+      // M1 micro-confirmation: require M1 EMA structure to agree with direction
+      if (!microConfirmM1(setup.direction)) {
+        log.info(`[M5] M1 micro-confirm FAIL for ${setup.direction} — entry blocked`);
+        state.setSetupScalp({ active: false });
+        return;
+      }
       await placeOrder('SCALP', setup, bid, ask);
       state.setSetupScalp({ active: false });
     }
@@ -730,4 +902,55 @@ async function onH1Close() {
   }
 }
 
-module.exports = { onM5Close, onH1Close, managePositions, reconcilePositions };
+// ══════════════════════════════════════════════════════════════
+// M1 micro-confirmation
+// ══════════════════════════════════════════════════════════════
+
+/**
+ * M1 EMA micro-confirmation gate applied just before a SCALP entry.
+ *
+ * BUY:  EMA20(M1) > EMA50(M1)  AND  close(M1) > EMA20(M1)
+ * SELL: EMA20(M1) < EMA50(M1)  AND  close(M1) < EMA20(M1)
+ *
+ * Returns true if the gate passes (or if MICRO_CONFIRM_ENABLED is false).
+ * Returns false (blocking entry) if the M1 structure disagrees.
+ */
+function microConfirmM1(direction) {
+  if (!cfg.MICRO_CONFIRM_ENABLED) return true;
+
+  const candles = cs.get('M1');
+  if (candles.length < cfg.MICRO_EMA_SLOW_PERIOD) {
+    log.debug(`[M1] Insufficient bars for micro-confirm (${candles.length}/${cfg.MICRO_EMA_SLOW_PERIOD}) — blocking`);
+    return false;
+  }
+
+  const ema20 = ind.ema(closes(candles), cfg.MICRO_EMA_FAST_PERIOD);
+  const ema50 = ind.ema(closes(candles), cfg.MICRO_EMA_SLOW_PERIOD);
+  if (ema20 === null || ema50 === null) return false;
+
+  const close = last(candles).close;
+
+  if (direction === 'BUY') {
+    const ok = ema20 > ema50 && close > ema20;
+    log.debug(
+      `[M1] Micro-confirm BUY: ema20=${ema20.toFixed(4)} ema50=${ema50.toFixed(4)} ` +
+      `close=${close.toFixed(4)} → ${ok ? 'PASS' : 'FAIL'}`
+    );
+    return ok;
+  } else {
+    const ok = ema20 < ema50 && close < ema20;
+    log.debug(
+      `[M1] Micro-confirm SELL: ema20=${ema20.toFixed(4)} ema50=${ema50.toFixed(4)} ` +
+      `close=${close.toFixed(4)} → ${ok ? 'PASS' : 'FAIL'}`
+    );
+    return ok;
+  }
+}
+
+module.exports = {
+  onM5Close,
+  onH1Close,
+  managePositions,
+  reconcilePositions,
+  syncExistingPositions,
+};

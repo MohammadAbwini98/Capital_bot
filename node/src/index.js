@@ -60,20 +60,10 @@ async function main() {
   await cs.loadHistory();
   log.info('[Main] Candle history ready.');
 
-  // Step 4: log any open positions already on the platform
-  try {
-    const platformPos = await api.getPositions();
-    if (platformPos.length) {
-      log.warn(
-        `[Main] ${platformPos.length} position(s) already open on platform — ` +
-        'these are NOT tracked by the bot (they will be managed by their own SL/TP).'
-      );
-    } else {
-      log.info('[Main] No existing platform positions found.');
-    }
-  } catch (e) {
-    log.warn(`[Main] Could not check platform positions: ${e.message}`);
-  }
+  // Step 4: adopt any positions already open on the platform (Bug #6 fix)
+  // TP1 is reconstructed from entry/SL so management works after a restart.
+  log.info('[Main] Syncing existing platform positions...');
+  await strategy.syncExistingPositions();
 
   // Step 5: start polling loops
   log.separator('─');
@@ -81,11 +71,12 @@ async function main() {
 
   // Fix #6: per-loop busy guards prevent overlapping async executions
   // when a loop iteration takes longer than its poll interval.
-  let tickBusy  = false;
-  let m5Busy    = false;
-  let m15Busy   = false;
-  let h1Busy    = false;
-  let h4Busy    = false;
+  let tickBusy   = false;
+  let m1Busy     = false;
+  let m5Busy     = false;
+  let m15Busy    = false;
+  let h1Busy     = false;
+  let h4Busy     = false;
   let reconcBusy = false;
 
   // ── Tick loop: position management + live price display every 5 s ──
@@ -107,6 +98,15 @@ async function main() {
       log.live(`${cfg.EPIC}  bid=${bid.toFixed(4)}  ask=${ask.toFixed(4)}  spread=${spread}  ${now}`);
     } catch { /* non-fatal — skip this tick */ }
   }, cfg.TICK_POLL_MS));
+
+  // ── M1 poll: keep micro-confirm data current every 15 s ──
+  timers.push(setInterval(async () => {
+    if (shutting || m1Busy) return;
+    m1Busy = true;
+    try { await cs.update('M1'); }
+    catch (e) { if (!shutting) log.warn(`[M1 Poll] Error: ${e.message}`); }
+    finally { m1Busy = false; }
+  }, cfg.M1_POLL_MS));
 
   // ── M5 poll: detect candle close every 30 s ──
   timers.push(setInterval(async () => {

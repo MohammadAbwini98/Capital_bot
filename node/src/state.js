@@ -64,6 +64,16 @@ function addPosition(pos) {
 }
 
 /**
+ * Adopt an existing platform position discovered at startup.
+ * Does NOT increment tradesToday (the trade was already counted/not ours).
+ * @param {Position} pos
+ */
+function adoptPosition(pos) {
+  openPositions.push(pos);
+  log.info(`[State] Position adopted from platform: ${pos.mode} ${pos.direction} dealId=${pos.dealId}`);
+}
+
+/**
  * Add a replacement position (TP1 partial-close reopen).
  * Does NOT increment tradesToday.
  */
@@ -145,7 +155,7 @@ function getStats() {
 
 module.exports = {
   riskOK,
-  addPosition, replacePosition, removePosition, getPositions,
+  addPosition, adoptPosition, replacePosition, removePosition, getPositions,
   updatePnL,
   getSetupScalp, setSetupScalp,
   getSetupSwing, setSetupSwing,

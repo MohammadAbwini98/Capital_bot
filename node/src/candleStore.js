@@ -10,6 +10,7 @@ const log = require('./logger');
 
 // Resolution names used by Capital.com API
 const RESOLUTION = {
+  M1:  'MINUTE',
   M5:  'MINUTE_5',
   M15: 'MINUTE_15',
   H1:  'HOUR',
@@ -18,6 +19,7 @@ const RESOLUTION = {
 
 // Duration of each timeframe in milliseconds
 const TF_MS = {
+  M1:  60_000,
   M5:  5  * 60_000,
   M15: 15 * 60_000,
   H1:  60 * 60_000,
@@ -48,9 +50,11 @@ function dropInProgress(tf, bars) {
 }
 
 // Per-TF history depth.
-// M5/M15 use 600 bars: 200 for EMA200 warmup + 400 bars of live context.
-// H1/H4 use cfg.HISTORY_BARS (300 default) — sufficient for EMA200.
+// M1: 300 bars (covers EMA50 warmup for micro-confirm).
+// M5/M15: 600 bars — 200 for EMA200 warmup + 400 bars of live context.
+// H1/H4: cfg.HISTORY_BARS (300) — sufficient for EMA200.
 const TF_HISTORY = {
+  M1:  300,
   M5:  600,
   M15: 600,
   H1:  cfg.HISTORY_BARS,
@@ -58,14 +62,16 @@ const TF_HISTORY = {
 };
 
 // In-memory candle stores (closed bars only)
-const store = { M5: [], M15: [], H1: [], H4: [] };
+const store = { M1: [], M5: [], M15: [], H1: [], H4: [] };
 
 // Timestamp of the most recently processed closed bar per TF
-const lastClosedTime = { M5: 0, M15: 0, H1: 0, H4: 0 };
+const lastClosedTime = { M1: 0, M5: 0, M15: 0, H1: 0, H4: 0 };
 
-// Active timeframes (H1/H4 added only when swing mode is on)
+// Active timeframes — M1 always included for micro-confirm; H1/H4 only with swing
 function activeTFs() {
-  return cfg.swingEnabled ? ['M5', 'M15', 'H1', 'H4'] : ['M5', 'M15'];
+  return cfg.swingEnabled
+    ? ['M1', 'M5', 'M15', 'H1', 'H4']
+    : ['M1', 'M5', 'M15'];
 }
 
 // ── Startup history load ────────────────────────────────────────

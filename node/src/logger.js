@@ -8,6 +8,23 @@
 const fs   = require('fs');
 const path = require('path');
 
+// ── Log file write stream ───────────────────────────────────────
+// A single stream per calendar day ensures log lines are written in
+// the order they are emitted (no async reordering under load).
+let _stream     = null;
+let _streamDate = '';
+
+function _getStream() {
+  const today = new Date().toISOString().slice(0, 10); // 'YYYY-MM-DD'
+  if (_streamDate !== today || !_stream || _stream.destroyed) {
+    if (_stream && !_stream.destroyed) _stream.end();
+    _stream     = fs.createWriteStream(logFilePath(), { flags: 'a' });
+    _streamDate = today;
+    _stream.on('error', () => { _stream = null; }); // self-heal on I/O error
+  }
+  return _stream;
+}
+
 // ── ANSI colour codes (terminal only) ─────────────────────────
 const C = {
   reset:  '\x1b[0m',
@@ -62,8 +79,9 @@ function emit(color, level, args) {
   // Terminal — coloured
   process.stdout.write(`${color}[${timestamp}] [${padded}]${C.reset} ${msg}\n`);
 
-  // File — plain text, async so it never blocks the event loop
-  fs.appendFile(logFilePath(), `[${timestamp}] [${padded}] ${msg}\n`, () => {});
+  // File — written via a persistent stream so lines stay in order
+  const s = _getStream();
+  if (s) s.write(`[${timestamp}] [${padded}] ${msg}\n`);
 }
 
 module.exports = {
