@@ -29,7 +29,7 @@ from sklearn.model_selection import cross_val_score
 
 # ── Config ────────────────────────────────────────────────────
 WINDOW_DAYS    = 30     # rolling training window
-MIN_SAMPLES    = 100    # minimum labelled rows to train
+MIN_SAMPLES    = 50     # minimum labelled rows to train
 BUY_THRESHOLD  = 0.60  # p(up) threshold for BUY entries
 SELL_THRESHOLD = 0.40  # p(up) threshold for SELL entries (p(down) >= 0.60)
 
@@ -165,7 +165,7 @@ def main():  # pylint: disable=too-many-locals
             """), {
                 'v':     version,
                 'n':     len(df),
-                'auc':   round(cv_auc, 4),
+                'auc':   round(float(cv_auc), 4),
                 'notes': f'window={WINDOW_DAYS}d C=1.0',
             })
             conn.commit()
