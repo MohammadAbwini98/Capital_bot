@@ -102,12 +102,12 @@ def main():  # pylint: disable=too-many-locals
                 base_ts   = ts_sorted[base_pos]
                 future_ts = ts_sorted[future_pos]
 
-                base_close   = candles_df.loc[base_ts,   'close']
-                future_close = candles_df.loc[future_ts, 'close']
-                base_atr     = atr_series.loc[base_ts]
+                base_close   = float(candles_df.at[base_ts,   'close'])  # type: ignore[arg-type]
+                future_close = float(candles_df.at[future_ts, 'close'])  # type: ignore[arg-type]
+                base_atr     = float(atr_series.at[base_ts])              # type: ignore[arg-type]
 
-                future_return = float(future_close - base_close)
-                ret_norm      = float(future_return / base_atr) if base_atr > 0 else 0.0
+                future_return = future_close - base_close
+                ret_norm      = future_return / base_atr if base_atr > 0 else 0.0
 
                 label = 0
                 if ret_norm >= RET_THRESHOLD:

@@ -101,7 +101,7 @@ def main():  # pylint: disable=too-many-locals
         for row in df['features_parsed']
     ])
     # Binary: predict whether price goes up (+1 class)
-    y = (df['label'] == 1).astype(int).values
+    y = np.asarray((df['label'] == 1).astype(int))
 
     # Train logistic regression with L2 regularisation
     pipe = Pipeline([
