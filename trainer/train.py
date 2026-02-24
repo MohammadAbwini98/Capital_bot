@@ -16,16 +16,16 @@ Requires: DB_URL in .env
 import os
 import sys
 import json
+from datetime import datetime, timezone, timedelta
+
 import numpy as np
 import pandas as pd
-from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import cross_val_score
-from sklearn.metrics import roc_auc_score
 
 # ── Config ────────────────────────────────────────────────────
 WINDOW_DAYS    = 30     # rolling training window
@@ -69,7 +69,8 @@ def extract_feature(features_json: dict, name: str) -> float:
         return 0.0
 
 
-def main():
+def main():  # pylint: disable=too-many-locals
+    """Train logistic regression on labelled signals and export model JSON."""
     cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=WINDOW_DAYS)).timestamp() * 1000)
 
     with engine.connect() as conn:
@@ -95,7 +96,7 @@ def main():
         lambda x: x if isinstance(x, dict) else json.loads(x)
     )
 
-    X = np.array([
+    x_train = np.array([
         [extract_feature(row, name) for name in FEATURE_NAMES]
         for row in df['features_parsed']
     ])
@@ -109,11 +110,11 @@ def main():
     ])
 
     # 5-fold CV for diagnostics
-    cv_auc = cross_val_score(pipe, X, y, cv=5, scoring='roc_auc').mean()
+    cv_auc = cross_val_score(pipe, x_train, y, cv=5, scoring='roc_auc').mean()
     print(f'  CV ROC-AUC: {cv_auc:.4f}')
 
     # Final fit on all data
-    pipe.fit(X, y)
+    pipe.fit(x_train, y)
     lr = pipe.named_steps['lr']
     sc = pipe.named_steps['scaler']
 
@@ -141,7 +142,7 @@ def main():
     }
 
     out_path = os.path.join(MODELS_DIR, 'current.json')
-    with open(out_path, 'w') as f:
+    with open(out_path, 'w', encoding='utf-8') as f:
         json.dump(model, f, indent=2)
 
     print(f'  Model saved → {out_path}')
@@ -149,7 +150,7 @@ def main():
 
     # Also save a timestamped archive copy
     archive_path = os.path.join(MODELS_DIR, f'model_{version}.json')
-    with open(archive_path, 'w') as f:
+    with open(archive_path, 'w', encoding='utf-8') as f:
         json.dump(model, f, indent=2)
     print(f'  Archive → {archive_path}')
 
@@ -168,7 +169,7 @@ def main():
                 'notes': f'window={WINDOW_DAYS}d C=1.0',
             })
             conn.commit()
-    except Exception as e:
+    except Exception as e:  # pylint: disable=broad-exception-caught
         print(f'  Warning: could not register model in DB: {e}')
 
 

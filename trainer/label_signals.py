@@ -18,10 +18,8 @@ Requirements: set DB_URL in .env (or environment).
 
 import os
 import sys
-import json
-import numpy as np
+
 import pandas as pd
-from datetime import datetime, timezone
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
@@ -49,7 +47,8 @@ def compute_atr(df_candles: pd.DataFrame, period: int = ATR_PERIOD) -> pd.Series
     return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 
-def main():
+def main():  # pylint: disable=too-many-locals
+    """Label all unlabelled SCALP signals using future M5 candle returns."""
     with engine.connect() as conn:
         # Load all unlabelled SCALP signals
         signals_df = pd.read_sql(text("""
