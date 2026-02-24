@@ -1,0 +1,5 @@
+{
+  "venvPath": "trainer",
+  "venv": ".venv",
+  "pythonVersion": "3.13"
+}
