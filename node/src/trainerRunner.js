@@ -1,12 +1,11 @@
 // ==============================================================
 // GoldBot — trainerRunner.js
 // Runs the Python ML training pipeline from within Node.js.
-// Called automatically every night ~30 min after UTC midnight.
 //
-// Pipeline:
-//   1. label_signals.py  — computes training labels from candle DB
-//   2. train.py          — trains logistic regression, writes model JSON
-//   3. mlModel.reload()  — hot-loads the new model (no restart needed)
+// Two jobs:
+//   runLabeler()       — label_signals.py only  (runs every 30 min)
+//   runNightlyTrainer()— full pipeline: label → train → promote
+//                        (runs once at 00:30 UTC)
 // ==============================================================
 
 const { spawn } = require('child_process');
@@ -63,6 +62,20 @@ function runScript(scriptName) {
 }
 
 /**
+ * Run label_signals.py only — lightweight, runs every 30 minutes.
+ * Keeps the labels table current throughout the trading day so that
+ * signals have fresh labels when the nightly trainer fires.
+ * Non-fatal: any error is logged but does not crash the bot.
+ */
+async function runLabeler() {
+  try {
+    await runScript('label_signals.py');
+  } catch (e) {
+    log.warn(`[Trainer] Labeler error (non-fatal): ${e.message}`);
+  }
+}
+
+/**
  * Run the full nightly training pipeline.
  * Non-fatal: any error is logged but does not crash the bot.
  */
@@ -73,8 +86,9 @@ async function runNightlyTrainer() {
   try {
     await runScript('label_signals.py');
     await runScript('train.py');
+    await runScript('promote.py');
 
-    // Hot-reload model — picks up the new JSON without restarting
+    // Hot-reload model — picks up the new champion (if promoted) without restarting
     mlModel.reload();
     log.info('[Trainer] Pipeline complete — model reloaded.');
   } catch (e) {
@@ -84,4 +98,4 @@ async function runNightlyTrainer() {
   log.separator('─');
 }
 
-module.exports = { runNightlyTrainer };
+module.exports = { runLabeler, runNightlyTrainer };

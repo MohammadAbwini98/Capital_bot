@@ -10,16 +10,17 @@
 //   reconcilePositions()   — run periodically to sync with platform
 // ==============================================================
 
-const cfg         = require('./config');
-const log         = require('./logger');
-const ind         = require('./indicators');
-const cs          = require('./candleStore');
-const state       = require('./state');
-const api         = require('./api');
-const telegram    = require('./telegram');
-const signalsRepo = require('./repo/signalsRepo');
-const tradesRepo  = require('./repo/tradesRepo');
-const mlModel     = require('./mlModel');
+const cfg             = require('./config');
+const log             = require('./logger');
+const ind             = require('./indicators');
+const cs              = require('./candleStore');
+const state           = require('./state');
+const api             = require('./api');
+const telegram        = require('./telegram');
+const signalsRepo     = require('./repo/signalsRepo');
+const tradesRepo      = require('./repo/tradesRepo');
+const predictionsRepo = require('./repo/predictionsRepo');
+const mlModel         = require('./mlModel');
 
 // ── Array extractors ───────────────────────────────────────────
 
@@ -34,15 +35,39 @@ const last   = c => c[c.length - 1];
 // consecutive misses do we confirm via a direct single-position GET.
 const _reconcileMissCount = {};
 
-// ── PnL helper: prefer broker-reported profit, fall back to math ──
+// ── PnL helpers ────────────────────────────────────────────────
 
-function resolvePnl(confirmed, direction, entry, exitPrice, size) {
-  if (confirmed && typeof confirmed.profit === 'number') {
-    return confirmed.profit;
-  }
+/**
+ * Directional math PnL — NOT reliable for CFDs (contract-spec dependent).
+ * Used only as a last-resort fallback.
+ */
+function _mathPnl(direction, entry, exitPrice, size) {
   return direction === 'BUY'
     ? (exitPrice - entry) * size
     : (entry - exitPrice) * size;
+}
+
+/**
+ * Resolve realized PnL with priority order:
+ *   1. confirmed.profit  (from deal confirmation)
+ *   2. activity history  (authoritative for CFD products)
+ *   3. directional math  (last resort — may be wrong for CFDs)
+ *
+ * @param {object|null} confirmed   Deal confirmation object from closePosition()
+ * @param {string}      dealId
+ * @param {number}      openedTime  Position open time (epoch ms)
+ * @param {string}      direction   'BUY' | 'SELL'
+ * @param {number}      entry
+ * @param {number}      exitPrice
+ * @param {number}      size
+ * @returns {Promise<number>}
+ */
+async function resolvePnlAsync(confirmed, dealId, openedTime, direction, entry, exitPrice, size) {
+  if (confirmed && typeof confirmed.profit === 'number') return confirmed.profit;
+  const histPnl = await api.recoverPnlFromHistory(dealId, openedTime);
+  if (histPnl !== null) return histPnl;
+  log.debug(`[PnL] No broker PnL for ${dealId} — falling back to directional math (CFD warning)`);
+  return _mathPnl(direction, entry, exitPrice, size);
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -141,6 +166,30 @@ function chopFilter(tf) {
 
 // ══════════════════════════════════════════════════════════════
 // H) Setup detection
+
+/**
+ * True rejection candle test — replaces simple "close > open" check.
+ * BUY:  close in top 40% of range  AND lower wick ≥ 30% of range.
+ * SELL: close in bottom 40% of range AND upper wick ≥ 30% of range.
+ */
+function _isRejectionCandle(bar, direction) {
+  const range = bar.high - bar.low;
+  if (range === 0) return false;
+
+  if (direction === 'BUY') {
+    if (bar.close <= bar.open) return false;
+    const closePosition = (bar.close - bar.low) / range;
+    const lowerWick     = Math.min(bar.open, bar.close) - bar.low;
+    return closePosition >= cfg.REJECTION_CLOSE_PCT &&
+           lowerWick / range >= cfg.REJECTION_WICK_PCT;
+  } else {
+    if (bar.close >= bar.open) return false;
+    const closePosition = (bar.high - bar.close) / range;
+    const upperWick     = bar.high - Math.max(bar.open, bar.close);
+    return closePosition >= cfg.REJECTION_CLOSE_PCT &&
+           upperWick / range >= cfg.REJECTION_WICK_PCT;
+  }
+}
 // ══════════════════════════════════════════════════════════════
 
 /**
@@ -159,49 +208,108 @@ function createSetup(tf, trend) {
   const atrVal = ind.atr(highs(candles), lows(candles), closes(candles), cfg.ATR_PERIOD);
   if (ema20 === null || ema50 === null || atrVal === null) return { active: false };
 
+  // Trend strength proxy: |EMA20 − EMA50| / ATR
+  const spreadATR = Math.abs(ema20 - ema50) / atrVal;
+
+  // Chop check — too flat to trade
+  if (spreadATR < cfg.CHOP_EMA_DIST_ATR_MIN) {
+    log.debug(`[Setup] ${tf}: spreadATR=${spreadATR.toFixed(3)} < ${cfg.CHOP_EMA_DIST_ATR_MIN} — chop, no setup`);
+    return { active: false };
+  }
+
+  // Adaptive EMA50 tolerance: widens as trend strengthens, capped at TOL_MAX
+  const tolFactor = Math.min(
+    cfg.PULLBACK_TOL_MAX,
+    cfg.PULLBACK_TOL_BASE + cfg.PULLBACK_TOL_K * Math.max(0, spreadATR - cfg.CHOP_EMA_DIST_ATR_MIN)
+  );
+  const tol50 = tolFactor * atrVal;
+  const tol20 = cfg.FAST_PULLBACK_TOL * atrVal;
+  const allowFast = spreadATR >= cfg.FAST_PULLBACK_SPREADATR_MIN;
+
   const bar = last(candles);
-  const tol = cfg.PULLBACK_ATR_TOL * atrVal;
 
   if (trend === 'UP') {
-    // EMA alignment: EMA20 must be above EMA50 to confirm uptrend structure
     if (ema20 <= ema50) {
       log.debug(`[Setup] ${tf}: BUY EMA alignment fail — ema20=${ema20.toFixed(4)} ≤ ema50=${ema50.toFixed(4)}`);
       return { active: false };
     }
-    // Proximity to EMA50
-    const dist = Math.abs(bar.low - ema50);
-    if (dist > tol) {
-      log.debug(`[Setup] ${tf}: BUY not formed — low=${bar.low.toFixed(4)} too far from ema50=${ema50.toFixed(4)} (dist=${dist.toFixed(4)} tol=${tol.toFixed(4)})`);
+
+    const dist50 = Math.abs(bar.low - ema50);
+    const dist20 = Math.abs(bar.low - ema20);
+    const touchEma50 = dist50 <= tol50;
+    const touchEma20 = allowFast && dist20 <= tol20;
+
+    if (!touchEma50 && !touchEma20) {
+      log.debug(
+        `[Setup] ${tf}: BUY not formed — low=${bar.low.toFixed(4)} ` +
+        `ema50 dist=${dist50.toFixed(4)} tol=${tol50.toFixed(4)} | ` +
+        `ema20 dist=${dist20.toFixed(4)} tol=${tol20.toFixed(4)} fastOk=${allowFast}`
+      );
       return { active: false };
     }
-    // Rejection candle: must close bullish (price rejected the EMA50 and closed back up)
-    if (bar.close <= bar.open) {
-      log.debug(`[Setup] ${tf}: BUY no rejection candle — bar bearish (close=${bar.close.toFixed(4)} open=${bar.open.toFixed(4)})`);
+
+    if (!_isRejectionCandle(bar, 'BUY')) {
+      const range = bar.high - bar.low;
+      log.debug(
+        `[Setup] ${tf}: BUY rejection fail — ` +
+        `closePos=${range ? ((bar.close - bar.low) / range).toFixed(2) : 'n/a'} ` +
+        `lowerWick=${range ? ((Math.min(bar.open, bar.close) - bar.low) / range).toFixed(2) : 'n/a'}`
+      );
       return { active: false };
     }
-    log.info(`[Setup] BUY setup on ${tf}: low=${bar.low.toFixed(4)} ema50=${ema50.toFixed(4)} dist=${dist.toFixed(4)} tol=${tol.toFixed(4)}`);
-    return { active: true, direction: 'BUY', createdTime: bar.time, pullbackExtreme: bar.low };
+
+    const touchType = touchEma50 ? 'EMA50' : 'EMA20';
+    const refEma    = touchEma50 ? ema50   : ema20;
+    log.info(
+      `[Setup] BUY setup on ${tf}: touch=${touchType} low=${bar.low.toFixed(4)} ` +
+      `ref=${refEma.toFixed(4)} spreadATR=${spreadATR.toFixed(3)} tol=${tol50.toFixed(4)}`
+    );
+    return {
+      active: true, direction: 'BUY', createdTime: bar.time,
+      pullbackExtreme: bar.low, touchType, touchPrice: bar.low, refEma,
+    };
   }
 
   if (trend === 'DOWN') {
-    // EMA alignment: EMA20 must be below EMA50 to confirm downtrend structure
     if (ema20 >= ema50) {
       log.debug(`[Setup] ${tf}: SELL EMA alignment fail — ema20=${ema20.toFixed(4)} ≥ ema50=${ema50.toFixed(4)}`);
       return { active: false };
     }
-    // Proximity to EMA50
-    const dist = Math.abs(bar.high - ema50);
-    if (dist > tol) {
-      log.debug(`[Setup] ${tf}: SELL not formed — high=${bar.high.toFixed(4)} too far from ema50=${ema50.toFixed(4)} (dist=${dist.toFixed(4)} tol=${tol.toFixed(4)})`);
+
+    const dist50 = Math.abs(bar.high - ema50);
+    const dist20 = Math.abs(bar.high - ema20);
+    const touchEma50 = dist50 <= tol50;
+    const touchEma20 = allowFast && dist20 <= tol20;
+
+    if (!touchEma50 && !touchEma20) {
+      log.debug(
+        `[Setup] ${tf}: SELL not formed — high=${bar.high.toFixed(4)} ` +
+        `ema50 dist=${dist50.toFixed(4)} tol=${tol50.toFixed(4)} | ` +
+        `ema20 dist=${dist20.toFixed(4)} tol=${tol20.toFixed(4)} fastOk=${allowFast}`
+      );
       return { active: false };
     }
-    // Rejection candle: must close bearish (price rejected the EMA50 and closed back down)
-    if (bar.close >= bar.open) {
-      log.debug(`[Setup] ${tf}: SELL no rejection candle — bar bullish (close=${bar.close.toFixed(4)} open=${bar.open.toFixed(4)})`);
+
+    if (!_isRejectionCandle(bar, 'SELL')) {
+      const range = bar.high - bar.low;
+      log.debug(
+        `[Setup] ${tf}: SELL rejection fail — ` +
+        `closePos=${range ? ((bar.high - bar.close) / range).toFixed(2) : 'n/a'} ` +
+        `upperWick=${range ? ((bar.high - Math.max(bar.open, bar.close)) / range).toFixed(2) : 'n/a'}`
+      );
       return { active: false };
     }
-    log.info(`[Setup] SELL setup on ${tf}: high=${bar.high.toFixed(4)} ema50=${ema50.toFixed(4)} dist=${dist.toFixed(4)} tol=${tol.toFixed(4)}`);
-    return { active: true, direction: 'SELL', createdTime: bar.time, pullbackExtreme: bar.high };
+
+    const touchType = touchEma50 ? 'EMA50' : 'EMA20';
+    const refEma    = touchEma50 ? ema50   : ema20;
+    log.info(
+      `[Setup] SELL setup on ${tf}: touch=${touchType} high=${bar.high.toFixed(4)} ` +
+      `ref=${refEma.toFixed(4)} spreadATR=${spreadATR.toFixed(3)} tol=${tol50.toFixed(4)}`
+    );
+    return {
+      active: true, direction: 'SELL', createdTime: bar.time,
+      pullbackExtreme: bar.high, touchType, touchPrice: bar.high, refEma,
+    };
   }
 
   return { active: false };
@@ -298,32 +406,183 @@ function triggerBOS(tf, setup, bosLookback, spread = 0) {
 }
 
 // ══════════════════════════════════════════════════════════════
+// I-2) Additional execution quality gates
+// ══════════════════════════════════════════════════════════════
+
+/**
+ * M5 RSI momentum gate.
+ * BUY blocked if RSI < M5_RSI_BUY_MIN; SELL blocked if RSI > M5_RSI_SELL_MAX.
+ * Returns true (allow) when not enough data to compute RSI.
+ */
+function rsiGateM5(direction) {
+  const m5 = cs.get('M5');
+  const rsiVal = ind.rsi(closes(m5), cfg.RSI_PERIOD);
+  if (rsiVal === null) return true;
+  if (direction === 'BUY'  && rsiVal < cfg.M5_RSI_BUY_MIN) {
+    log.debug(`[RSI] M5 BUY blocked: RSI=${rsiVal.toFixed(1)} < ${cfg.M5_RSI_BUY_MIN}`);
+    return false;
+  }
+  if (direction === 'SELL' && rsiVal > cfg.M5_RSI_SELL_MAX) {
+    log.debug(`[RSI] M5 SELL blocked: RSI=${rsiVal.toFixed(1)} > ${cfg.M5_RSI_SELL_MAX}`);
+    return false;
+  }
+  log.debug(`[RSI] M5 RSI=${rsiVal.toFixed(1)} OK for ${direction}`);
+  return true;
+}
+
+/**
+ * M5 ATR ratio volatility gate.
+ * Blocks entries when current ATR is well below its recent average (dead market).
+ * Returns true (allow) when not enough data.
+ */
+function atrRatioGateM5() {
+  const m5     = cs.get('M5');
+  const atrVal = ind.atr(highs(m5), lows(m5), closes(m5), cfg.ATR_PERIOD);
+  if (atrVal !== null && atrVal < cfg.ATR_ABS_MIN_M5) {
+    log.debug(`[ATR Ratio] M5 blocked: atr=${atrVal.toFixed(4)} < floor=${cfg.ATR_ABS_MIN_M5} — dead market`);
+    return false;
+  }
+  const ratio = ind.atrRatio(highs(m5), lows(m5), closes(m5), cfg.ATR_PERIOD, cfg.ATR_RATIO_SMA_PERIOD);
+  if (ratio === null) return true;
+  if (ratio < cfg.ATR_RATIO_MIN) {
+    log.debug(`[ATR Ratio] M5 blocked: ratio=${ratio.toFixed(3)} < min=${cfg.ATR_RATIO_MIN}`);
+    return false;
+  }
+  log.debug(`[ATR Ratio] M5 atr=${atrVal?.toFixed(4)} ratio=${ratio.toFixed(3)} OK`);
+  return true;
+}
+
+/**
+ * M5 BOS candle body quality gate.
+ * Requires the trigger bar's body to be >= BOS_CANDLE_BODY_ATR_MIN × ATR.
+ * Filters micro-wick BOS events that rarely follow through.
+ * @param {number|null} atrVal  Pre-computed M5 ATR
+ */
+function bosBodyGateM5(atrVal) {
+  if (!atrVal) return true;
+  const bar     = last(cs.get('M5'));
+  const body    = Math.abs(bar.close - bar.open);
+  const minBody = cfg.BOS_CANDLE_BODY_ATR_MIN * atrVal;
+  if (body < minBody) {
+    log.debug(`[Body] BOS bar body=${body.toFixed(4)} < min=${minBody.toFixed(4)} — skip`);
+    return false;
+  }
+  log.debug(`[Body] BOS bar body=${body.toFixed(4)} >= min=${minBody.toFixed(4)} OK`);
+  return true;
+}
+
+/**
+ * M15 trend strength + slope gate.
+ * Requires |close - EMA200| / ATR >= M15_TREND_STRENGTH_MIN
+ * and EMA200 slope to agree with the detected trend direction.
+ * Returns true (allow) when not enough data.
+ */
+function m15TrendStrengthGate(trend) {
+  const m15 = cs.get('M15');
+  if (m15.length < cfg.EMA_TREND_PERIOD) return true;
+  const ema200 = ind.ema(closes(m15), cfg.EMA_TREND_PERIOD);
+  const atr15  = ind.atr(highs(m15), lows(m15), closes(m15), cfg.M15_ATR_PERIOD);
+  if (!ema200 || !atr15) return true;
+
+  const closeLast = last(m15).close;
+  const strength  = Math.abs(closeLast - ema200) / atr15;
+  if (strength < cfg.M15_TREND_STRENGTH_MIN) {
+    log.debug(`[M15 Strength] blocked: strength=${strength.toFixed(2)} < ${cfg.M15_TREND_STRENGTH_MIN}`);
+    return false;
+  }
+
+  const slope = ind.emaSlope(closes(m15), cfg.EMA_TREND_PERIOD, cfg.M15_EMA200_SLOPE_BARS, atr15);
+  if (slope !== null) {
+    const slopeOk = (trend === 'UP' && slope > 0) || (trend === 'DOWN' && slope < 0);
+    if (!slopeOk) {
+      log.debug(`[M15 Slope] counter-trend: slope=${slope.toFixed(4)} for trend=${trend} — blocked`);
+      return false;
+    }
+    log.debug(`[M15 Slope] slope=${slope.toFixed(4)} OK for ${trend}`);
+  }
+
+  log.debug(`[M15 Strength] strength=${strength.toFixed(2)} OK`);
+  return true;
+}
+
+/**
+ * H1 macro alignment gate.
+ * Scalp BUY only if H1 close > H1 EMA200 and H1 RSI is not overbought.
+ * Scalp SELL only if H1 close < H1 EMA200 and H1 RSI is not oversold.
+ * Returns true (allow) when H1 data is insufficient.
+ */
+function h1MacroFilter(direction) {
+  const h1 = cs.get('H1');
+  if (h1.length < cfg.EMA_TREND_PERIOD) return true;
+  const ema200h1 = ind.ema(closes(h1), cfg.EMA_TREND_PERIOD);
+  const rsiH1    = ind.rsi(closes(h1), cfg.RSI_PERIOD);
+  if (!ema200h1) return true;
+
+  const closeH1 = last(h1).close;
+  if (direction === 'BUY'  && closeH1 < ema200h1) {
+    log.debug(`[H1 Macro] BUY blocked: H1 close=${closeH1.toFixed(4)} < EMA200=${ema200h1.toFixed(4)}`);
+    return false;
+  }
+  if (direction === 'SELL' && closeH1 > ema200h1) {
+    log.debug(`[H1 Macro] SELL blocked: H1 close=${closeH1.toFixed(4)} > EMA200=${ema200h1.toFixed(4)}`);
+    return false;
+  }
+  if (rsiH1 !== null) {
+    if (direction === 'BUY'  && rsiH1 > cfg.H1_RSI_OVERBOUGHT) {
+      log.debug(`[H1 Macro] BUY blocked: H1 RSI=${rsiH1.toFixed(1)} > ${cfg.H1_RSI_OVERBOUGHT}`);
+      return false;
+    }
+    if (direction === 'SELL' && rsiH1 < cfg.H1_RSI_OVERSOLD) {
+      log.debug(`[H1 Macro] SELL blocked: H1 RSI=${rsiH1.toFixed(1)} < ${cfg.H1_RSI_OVERSOLD}`);
+      return false;
+    }
+    log.debug(`[H1 Macro] H1 RSI=${rsiH1.toFixed(1)} OK`);
+  }
+  log.debug(`[H1 Macro] H1 close=${closeH1.toFixed(4)} EMA200=${ema200h1.toFixed(4)} OK for ${direction}`);
+  return true;
+}
+
+// ══════════════════════════════════════════════════════════════
 // J) SL/TP computation
 // ══════════════════════════════════════════════════════════════
 
-function computeSLTP(tf, setup, entryPrice, tp2R) {
+function computeSLTP(tf, mode, setup, entryPrice) {
   const candles = cs.get(tf);
   const atrVal  = ind.atr(highs(candles), lows(candles), closes(candles), cfg.ATR_PERIOD);
   const buffer  = cfg.SL_BUFFER_ATR * atrVal;
 
   let sl, tp1, tp2;
 
-  if (setup.direction === 'BUY') {
-    sl  = setup.pullbackExtreme - buffer;
-    const R = entryPrice - sl;
-    tp1 = entryPrice + cfg.TP1_R * R;
-    tp2 = entryPrice + tp2R      * R;
+  if (mode === 'SCALP') {
+    // ATR-based fixed targets — stable across volatility regimes
+    if (setup.direction === 'BUY') {
+      sl  = setup.pullbackExtreme - buffer;
+      tp1 = entryPrice + cfg.SCALP_TP1_ATR * atrVal;
+      tp2 = entryPrice + cfg.SCALP_TP2_ATR * atrVal;
+    } else {
+      sl  = setup.pullbackExtreme + buffer;
+      tp1 = entryPrice - cfg.SCALP_TP1_ATR * atrVal;
+      tp2 = entryPrice - cfg.SCALP_TP2_ATR * atrVal;
+    }
   } else {
-    sl  = setup.pullbackExtreme + buffer;
-    const R = sl - entryPrice;
-    tp1 = entryPrice - cfg.TP1_R * R;
-    tp2 = entryPrice - tp2R      * R;
+    // Swing: R-multiple targets
+    if (setup.direction === 'BUY') {
+      sl  = setup.pullbackExtreme - buffer;
+      const R = entryPrice - sl;
+      tp1 = entryPrice + cfg.TP1_R       * R;
+      tp2 = entryPrice + cfg.TP2_R_SWING * R;
+    } else {
+      sl  = setup.pullbackExtreme + buffer;
+      const R = sl - entryPrice;
+      tp1 = entryPrice - cfg.TP1_R       * R;
+      tp2 = entryPrice - cfg.TP2_R_SWING * R;
+    }
   }
 
   log.debug(
-    `[SLTP] ${tf} ${setup.direction}: extreme=${setup.pullbackExtreme.toFixed(4)} ` +
+    `[SLTP] ${tf} ${mode} ${setup.direction}: extreme=${setup.pullbackExtreme.toFixed(4)} ` +
     `buf=${buffer.toFixed(4)} atr=${atrVal.toFixed(4)} | ` +
-    `R=${Math.abs(entryPrice - sl).toFixed(4)} sl=${sl.toFixed(4)} tp1=${tp1.toFixed(4)} tp2=${tp2.toFixed(4)}`
+    `sl=${sl.toFixed(4)} tp1=${tp1.toFixed(4)} tp2=${tp2.toFixed(4)}`
   );
 
   return { sl, tp1, tp2 };
@@ -335,11 +594,10 @@ function computeSLTP(tf, setup, entryPrice, tp2R) {
 
 async function placeOrder(mode, setup, bid, ask) {
   const tf    = mode === 'SCALP' ? 'M5' : 'H1';
-  const tp2R  = mode === 'SCALP' ? cfg.TP2_R_SCALP : cfg.TP2_R_SWING;
   const size  = mode === 'SCALP' ? cfg.SCALP_SIZE_UNITS : cfg.SWING_SIZE_UNITS;
   const entry = setup.direction === 'BUY' ? ask : bid;
 
-  const { sl, tp1, tp2 } = computeSLTP(tf, setup, entry, tp2R);
+  const { sl, tp1, tp2 } = computeSLTP(tf, mode, setup, entry);
 
   // Fix #7: ATR/spread sanity — TP1 must be meaningful relative to the spread
   const spread   = ask - bid;
@@ -452,7 +710,7 @@ async function managePositions() {
       }
       // Fix #2: use broker-reported profit when available
       // Fix #3: mark as loss only when PnL is actually negative
-      const pnl = resolvePnl(confirmed, pos.direction, pos.entry, exitPrice, pos.size);
+      const pnl = await resolvePnlAsync(confirmed, pos.dealId, pos.openedTime, pos.direction, pos.entry, exitPrice, pos.size);
       state.updatePnL(pnl, pnl < 0);
       state.removePosition(pos.dealId);
       tradesRepo.closeTrade({ dealId: pos.dealId, closedTs: Date.now(), exit: exitPrice, realizedPnl: pnl, closeReason: 'SL_HIT' }).catch(() => {});
@@ -504,7 +762,7 @@ async function managePositions() {
           const remainingSize = pos.size - closeSize;
 
           // Fix #2: prefer broker profit, scaled to closed portion
-          const pnl1 = resolvePnl(confirmed, pos.direction, pos.entry, exitPrice, closeSize);
+          const pnl1 = await resolvePnlAsync(confirmed, pos.dealId, pos.openedTime, pos.direction, pos.entry, exitPrice, closeSize);
           // Fix #3: partial close at TP1 is rarely a loss, but use actual sign
           state.updatePnL(pnl1, pnl1 < 0);
           tradesRepo.closeTrade({ dealId: pos.dealId, closedTs: Date.now(), exit: exitPrice, realizedPnl: pnl1, closeReason: 'TP1_HIT' }).catch(() => {});
@@ -569,7 +827,7 @@ async function managePositions() {
         log.warn(`[Manage] TP2 close failed (may already be closed by platform): ${e.message}`);
       }
       // Fix #2: prefer broker profit; Fix #3: use actual sign
-      const pnl = resolvePnl(confirmed, pos.direction, pos.entry, exitPrice, pos.size);
+      const pnl = await resolvePnlAsync(confirmed, pos.dealId, pos.openedTime, pos.direction, pos.entry, exitPrice, pos.size);
       state.updatePnL(pnl, pnl < 0);
       state.removePosition(pos.dealId);
       tradesRepo.closeTrade({ dealId: pos.dealId, closedTs: Date.now(), exit: exitPrice, realizedPnl: pnl, closeReason: 'TP2_HIT' }).catch(() => {});
@@ -807,7 +1065,7 @@ async function onM5Close() {
   // The finally block always flushes it to the DB.
   const sig = {
     epic:         cfg.EPIC,
-    ts:           Date.now(),
+    ts:           last(cs.get('M5'))?.time ?? Date.now(),   // candle timestamp, not wall clock
     mode:         'SCALP',
     action:       'HOLD',
     reasons:      { riskOK: false },
@@ -828,7 +1086,7 @@ async function onM5Close() {
 
     // Pre-compute all gates so we can log a single summary line
     const spread   = ask - bid;
-    const spreadOk = spread <= cfg.SPREAD_MAX;
+    const spreadOk = spread <= cfg.SPREAD_MAX;   // crude check used for log below
     const trend    = trendFilterM15();
     const isChop   = chopFilter('M5');
     const setup    = state.getSetupScalp();
@@ -843,20 +1101,37 @@ async function onM5Close() {
     const m5  = cs.get('M5');
     const m15 = cs.get('M15');
     const m1  = cs.get('M1');
-    const m5_ema20  = m5.length  >= cfg.EMA_FAST_PERIOD    ? ind.ema(closes(m5),  cfg.EMA_FAST_PERIOD)    : null;
-    const m5_ema50  = m5.length  >= cfg.EMA_PULLBACK_PERIOD ? ind.ema(closes(m5),  cfg.EMA_PULLBACK_PERIOD) : null;
-    const m5_atr    = m5.length  >= cfg.ATR_PERIOD          ? ind.atr(highs(m5),  lows(m5),  closes(m5),  cfg.ATR_PERIOD) : null;
-    const m15_ema200 = m15.length >= cfg.EMA_TREND_PERIOD   ? ind.ema(closes(m15), cfg.EMA_TREND_PERIOD)   : null;
-    const m1_ema20  = m1.length  >= cfg.MICRO_EMA_FAST_PERIOD ? ind.ema(closes(m1), cfg.MICRO_EMA_FAST_PERIOD) : null;
-    const m1_ema50  = m1.length  >= cfg.MICRO_EMA_SLOW_PERIOD ? ind.ema(closes(m1), cfg.MICRO_EMA_SLOW_PERIOD) : null;
+    const h1  = cs.get('H1');
+
+    const m5_ema20   = m5.length  >= cfg.EMA_FAST_PERIOD      ? ind.ema(closes(m5),  cfg.EMA_FAST_PERIOD)      : null;
+    const m5_ema50   = m5.length  >= cfg.EMA_PULLBACK_PERIOD   ? ind.ema(closes(m5),  cfg.EMA_PULLBACK_PERIOD)  : null;
+    const m5_atr     = m5.length  >= cfg.ATR_PERIOD            ? ind.atr(highs(m5),   lows(m5),   closes(m5),   cfg.ATR_PERIOD) : null;
+    const m5_rsi14   = ind.rsi(closes(m5), cfg.RSI_PERIOD);
+    const m5_bb_width = ind.bollingerWidth(closes(m5), 20);
+    const m5_atr_ratio = ind.atrRatio(highs(m5), lows(m5), closes(m5), cfg.ATR_PERIOD, cfg.ATR_RATIO_SMA_PERIOD);
+
+    const m15_ema200  = m15.length >= cfg.EMA_TREND_PERIOD     ? ind.ema(closes(m15), cfg.EMA_TREND_PERIOD)     : null;
+    const m15_atr     = m15.length >= cfg.M15_ATR_PERIOD       ? ind.atr(highs(m15),  lows(m15),  closes(m15),  cfg.M15_ATR_PERIOD) : null;
+    const m15_ema200_slope = m15_atr
+      ? ind.emaSlope(closes(m15), cfg.EMA_TREND_PERIOD, cfg.M15_EMA200_SLOPE_BARS, m15_atr)
+      : null;
+
+    const m1_ema20   = m1.length  >= cfg.MICRO_EMA_FAST_PERIOD ? ind.ema(closes(m1),  cfg.MICRO_EMA_FAST_PERIOD) : null;
+    const m1_ema50   = m1.length  >= cfg.MICRO_EMA_SLOW_PERIOD ? ind.ema(closes(m1),  cfg.MICRO_EMA_SLOW_PERIOD) : null;
+
+    const h1_ema200  = h1.length  >= cfg.EMA_TREND_PERIOD      ? ind.ema(closes(h1),  cfg.EMA_TREND_PERIOD)     : null;
+    const h1_rsi14   = ind.rsi(closes(h1), cfg.RSI_PERIOD);
+
     const m5_close  = m5.length  ? last(m5).close  : null;
     const m15_close = m15.length ? last(m15).close : null;
+    const h1_close  = h1.length  ? last(h1).close  : null;
 
     sig.features = {
       spread,
       bid,
       ask,
       spread_norm:           m5_atr ? spread / m5_atr : null,
+      // M5 price structure
       m5_close,
       m5_ema20,
       m5_ema50,
@@ -865,14 +1140,31 @@ async function onM5Close() {
                                ? (m5_ema20 - m5_ema50) / m5_atr : null,
       m5_close_ema50_dist:   (m5_close != null && m5_ema50 != null)
                                ? m5_close - m5_ema50 : null,
+      // M5 momentum / volatility
+      m5_rsi14,
+      m5_bb_width,
+      m5_atr_ratio,
+      // M15 trend
       m15_close,
       m15_ema200,
+      m15_atr,
       m15_ema200_dist_atr:   (m15_close != null && m15_ema200 != null && m5_atr)
                                ? (m15_close - m15_ema200) / m5_atr : null,
+      m15_trend_strength:    (m15_close != null && m15_ema200 != null && m15_atr)
+                               ? Math.abs(m15_close - m15_ema200) / m15_atr : null,
+      m15_ema200_slope,
+      // H1 macro
+      h1_close,
+      h1_ema200,
+      h1_rsi14,
+      h1_ema200_dist_atr:    (h1_close != null && h1_ema200 != null && m5_atr)
+                               ? (h1_close - h1_ema200) / m5_atr : null,
+      // M1 micro-confirm
       m1_ema20,
       m1_ema50,
       m1_ema20_50_dist:      (m1_ema20 != null && m1_ema50 != null)
                                ? m1_ema20 - m1_ema50 : null,
+      // Gate flags
       chop:                  isChop ? 1 : 0,
       setup_active:          setup.active ? 1 : 0,
     };
@@ -886,8 +1178,15 @@ async function onM5Close() {
       setupDirection:   setup.active ? setup.direction : null,
     };
 
-    if (!spreadOk) {
-      log.warn(`[Strategy] Spread too wide: ${spread.toFixed(4)} (max ${cfg.SPREAD_MAX})`);
+    // Dynamic spread gate: max(SPREAD_MIN_GOLD, SPREAD_ATR_FACTOR × ATR), hard-capped by SPREAD_MAX
+    const dynamicSpreadMax = m5_atr
+      ? Math.min(cfg.SPREAD_MAX, Math.max(cfg.SPREAD_MIN_GOLD, cfg.SPREAD_ATR_FACTOR * m5_atr))
+      : cfg.SPREAD_MAX;
+    if (spread > dynamicSpreadMax) {
+      log.warn(
+        `[Strategy] Spread too wide: ${spread.toFixed(4)} > ${dynamicSpreadMax.toFixed(4)} ` +
+        `(max(${cfg.SPREAD_MIN_GOLD}, ${cfg.SPREAD_ATR_FACTOR}×ATR))`
+      );
       sig.action = 'SKIP_SPREAD'; return;
     }
 
@@ -909,6 +1208,27 @@ async function onM5Close() {
         sig.action = 'SKIP_TREND_FLIP'; return;
       }
 
+      // Structural invalidation: EMA alignment break or price failed through EMA50
+      if (m5_ema20 !== null && m5_ema50 !== null) {
+        const alignmentOk = setup.direction === 'BUY' ? m5_ema20 > m5_ema50 : m5_ema20 < m5_ema50;
+        if (!alignmentOk) {
+          log.info(`[M5] EMA alignment broken — invalidating ${setup.direction} setup`);
+          state.setSetupScalp({ active: false });
+          sig.action = 'SKIP_EMA_ALIGNMENT'; return;
+        }
+      }
+      if (m5_close !== null && m5_ema50 !== null && m5_atr !== null) {
+        const threshold = cfg.SETUP_INVALIDATION_ATR * m5_atr;
+        const meanBreak = setup.direction === 'BUY'
+          ? m5_close < m5_ema50 - threshold
+          : m5_close > m5_ema50 + threshold;
+        if (meanBreak) {
+          log.info(`[M5] Price broke through mean — invalidating ${setup.direction} setup`);
+          state.setSetupScalp({ active: false });
+          sig.action = 'SKIP_MEAN_BREAK'; return;
+        }
+      }
+
       if (setupExpired('M5', setup, cfg.SETUP_EXPIRY_BARS_SCALP)) {
         log.info('[M5] Setup expired — resetting');
         state.setSetupScalp({ active: false });
@@ -917,11 +1237,78 @@ async function onM5Close() {
 
       updateSetupExtreme('M5', setup);
 
+      // H1 macro alignment + M15 trend strength/slope — re-checked each bar
+      const h1MacroOk = h1MacroFilter(setup.direction);
+      sig.reasons.h1MacroOk = h1MacroOk;
+      if (!h1MacroOk) {
+        log.info(`[M5] H1 macro gate BLOCKED ${setup.direction}`);
+        state.setSetupScalp({ active: false });
+        sig.action = `${setup.direction}_SKIP_H1_MACRO`; return;
+      }
+
+      const m15StrengthOk = m15TrendStrengthGate(trend);
+      sig.reasons.m15StrengthOk = m15StrengthOk;
+      if (!m15StrengthOk) {
+        log.info(`[M5] M15 strength/slope gate BLOCKED`);
+        state.setSetupScalp({ active: false });
+        sig.action = `${setup.direction}_SKIP_M15_STRENGTH`; return;
+      }
+
       const bosOk = triggerBOS('M5', setup, cfg.BOS_LOOKBACK_SCALP, spread);
       sig.reasons.bosTriggered = bosOk;
-      sig.action = setup.direction === 'BUY' ? 'BUY_CANDIDATE' : 'SELL_CANDIDATE';
+      // Default: setup active but BOS not yet triggered → watching
+      sig.action = setup.direction === 'BUY' ? 'BUY_WATCHING' : 'SELL_WATCHING';
 
       if (bosOk) {
+        // BOS fired — upgrade to CANDIDATE and notify Telegram
+        sig.action = setup.direction === 'BUY' ? 'BUY_CANDIDATE' : 'SELL_CANDIDATE';
+        telegram.notifySetupCandidate({
+          direction:       setup.direction,
+          epic:            cfg.EPIC,
+          trend,
+          spread,
+          spreadOk,
+          pullbackExtreme: setup.pullbackExtreme ?? null,
+          bosTriggered:    true,
+          features:        sig.features,
+        });
+
+        // Set candidate features immediately on BOS trigger so that the
+        // challenger fallback notification fires even if a post-BOS gate blocks.
+        const candEntry = setup.direction === 'BUY' ? ask : bid;
+        const { sl: candSL, tp1: candTP1, tp2: candTP2 } = computeSLTP('M5', 'SCALP', setup, candEntry);
+        sig.features.candidate_direction = setup.direction;
+        sig.features.candidate_entry     = candEntry;
+        sig.features.candidate_sl        = candSL;
+        sig.features.candidate_tp1       = candTP1;
+        sig.features.candidate_tp2       = candTP2;
+        sig.features.candidate_spread    = spread;
+
+        // M5 execution quality gates (BOS-trigger-specific)
+        const rsiOk = rsiGateM5(setup.direction);
+        sig.reasons.rsiOk = rsiOk;
+        if (!rsiOk) {
+          log.info(`[M5] RSI gate BLOCKED ${setup.direction}`);
+          state.setSetupScalp({ active: false });
+          sig.action = `${setup.direction}_SKIP_RSI`; return;
+        }
+
+        const atrRatioOk = atrRatioGateM5();
+        sig.reasons.atrRatioOk = atrRatioOk;
+        if (!atrRatioOk) {
+          log.info(`[M5] ATR ratio gate BLOCKED — dead market`);
+          state.setSetupScalp({ active: false });
+          sig.action = `${setup.direction}_SKIP_ATR_RATIO`; return;
+        }
+
+        const bodyOk = bosBodyGateM5(m5_atr);
+        sig.reasons.bodyOk = bodyOk;
+        if (!bodyOk) {
+          log.info(`[M5] BOS candle body gate BLOCKED ${setup.direction}`);
+          state.setSetupScalp({ active: false });
+          sig.action = `${setup.direction}_SKIP_BODY`; return;
+        }
+
         const m1ok = microConfirmM1(setup.direction);
         sig.reasons.microConfirmOk = m1ok;
         if (!m1ok) {
@@ -940,6 +1327,21 @@ async function onM5Close() {
           const mlBlocked =
             (setup.direction === 'BUY'  && ml.score < cfg.ML_BUY_THRESHOLD) ||
             (setup.direction === 'SELL' && ml.score > cfg.ML_SELL_THRESHOLD);
+
+          // Notify Telegram with every ML decision (pass or block)
+          telegram.notifyPrediction({
+            direction: setup.direction,
+            epic:      cfg.EPIC,
+            score:     ml.score,
+            version:   ml.version,
+            mlBlocked,
+            candEntry: candEntry,
+            candSL:    candSL,
+            candTP1:   candTP1,
+            candTP2:   candTP2,
+            sigTs:     sig.ts,
+            signal:    { features: sig.features, reasons: sig.reasons, action: sig.action },
+          }).catch(() => {});
 
           if (mlBlocked) {
             log.info(
@@ -962,8 +1364,53 @@ async function onM5Close() {
     }
 
   } finally {
-    // Always persist the signal row (fire-and-forget)
-    signalsRepo.insertSignal(sig).catch(() => {});
+    // Persist signal row and log predictions (champion + challenger shadow)
+    const signalId = await signalsRepo.insertSignal(sig).catch(() => null);
+
+    if (signalId) {
+      // Champion prediction (only when the ML gate was actually evaluated)
+      if (sig.modelScore !== null && sig.modelVersion) {
+        predictionsRepo.insertPrediction({
+          signalId,
+          modelId: sig.modelVersion,
+          pWin:    sig.modelScore,
+          acted:   sig.action.endsWith('_EXEC'),
+          shadow:  false,
+          ts:      sig.ts,
+        }).catch(() => {});
+      }
+
+      // Challenger shadow score (logged every bar — never blocks trades)
+      const shadow = mlModel.scoreChallenger(sig.features);
+      if (shadow) {
+        predictionsRepo.insertPrediction({
+          signalId,
+          modelId: shadow.version,
+          pWin:    shadow.score,
+          acted:   false,
+          shadow:  true,
+          ts:      sig.ts,
+        }).catch(() => {});
+
+        // No champion model loaded, but challenger scored a BOS candidate:
+        // notify Telegram so the user still sees every ML prediction.
+        if (sig.modelScore === null && sig.features.candidate_direction) {
+          telegram.notifyPrediction({
+            direction: sig.features.candidate_direction,
+            epic:      cfg.EPIC,
+            score:     shadow.score,
+            version:   shadow.version + ' (challenger)',
+            mlBlocked: false,   // challenger never blocks trades
+            candEntry: sig.features.candidate_entry ?? null,
+            candSL:    sig.features.candidate_sl    ?? null,
+            candTP1:   sig.features.candidate_tp1   ?? null,
+            candTP2:   sig.features.candidate_tp2   ?? null,
+            sigTs:     sig.ts,
+            signal:    { features: sig.features, reasons: sig.reasons, action: sig.action },
+          }).catch(() => {});
+        }
+      }
+    }
   }
 }
 

@@ -5,19 +5,25 @@
 
 require('dotenv').config({ path: require('path').resolve(__dirname, '../..', '.env') });
 
-const api      = require('./api');
-const cs       = require('./candleStore');
-const state    = require('./state');
-const strategy = require('./strategy');
-const cfg      = require('./config');
-const log      = require('./logger');
-const ind      = require('./indicators');
-const telegram = require('./telegram');
-const db       = require('./db');
-const trainer  = require('./trainerRunner');
+const api        = require('./api');
+const cs         = require('./candleStore');
+const state      = require('./state');
+const strategy   = require('./strategy');
+const cfg        = require('./config');
+const log        = require('./logger');
+const ind        = require('./indicators');
+const telegram   = require('./telegram');
+const db         = require('./db');
+const trainer    = require('./trainerRunner');
+const quotesRepo = require('./repo/quotesRepo');
 
 let shutting = false;
 const timers = [];
+
+// ── Tick quote buffer ──────────────────────────────────────────
+// Bid/ask ticks are accumulated here and flushed to DB in one batch
+// every QUOTE_FLUSH_MS to keep DB write pressure low.
+const _quoteBuffer = [];
 
 // ══════════════════════════════════════════════════════════════
 // Startup
@@ -101,12 +107,29 @@ async function main() {
     }
     // Live in-place price ticker — overwrites same terminal line, not written to log file
     try {
-      const { bid, ask } = await api.getPrice(cfg.EPIC);
-      const spread = (ask - bid).toFixed(4);
+      const { bid, ask, status } = await api.getPrice(cfg.EPIC);
+      const spread = ask - bid;
       const now    = new Date().toISOString().replace('T', ' ').slice(11, 19) + ' UTC';
-      log.live(`${cfg.EPIC}  bid=${bid.toFixed(4)}  ask=${ask.toFixed(4)}  spread=${spread}  ${now}`);
+      log.live(`${cfg.EPIC}  bid=${bid.toFixed(4)}  ask=${ask.toFixed(4)}  spread=${spread.toFixed(4)}  ${now}`);
+      // Buffer tick for DB quote storage (flushed in bulk every QUOTE_FLUSH_MS)
+      if (cfg.DB_URL) {
+        _quoteBuffer.push({ ts: Date.now(), bid, ask, spread, status });
+      }
     } catch { /* non-fatal — skip this tick */ }
   }, cfg.TICK_POLL_MS));
+
+  // ── Quote flush: batch-write buffered ticks to DB every 60 s ──
+  if (cfg.DB_URL) {
+    timers.push(setInterval(async () => {
+      if (shutting || !_quoteBuffer.length) return;
+      const rows = _quoteBuffer.splice(0, _quoteBuffer.length);
+      try {
+        await quotesRepo.insertQuotesBatch(cfg.EPIC, rows);
+      } catch (e) {
+        if (!shutting) log.warn(`[Quotes] Flush error: ${e.message}`);
+      }
+    }, cfg.QUOTE_FLUSH_MS));
+  }
 
   // ── M1 poll: keep micro-confirm data current every 15 s ──
   timers.push(setInterval(async () => {
@@ -143,24 +166,26 @@ async function main() {
     finally { m15Busy = false; }
   }, cfg.M15_POLL_MS));
 
-  // ── Swing polls (only when SWING_ENABLED) ──
-  if (cfg.swingEnabled) {
-    timers.push(setInterval(async () => {
-      if (shutting || h1Busy) return;
-      h1Busy = true;
-      try {
-        const newClose = await cs.update('H1');
-        if (newClose) {
-          log.info('[Poll] H1 candle closed — running swing logic...');
-          await strategy.onH1Close();
-        }
-      } catch (e) {
-        if (!shutting) log.warn(`[H1 Poll] Error: ${e.message}`);
-      } finally {
-        h1Busy = false;
+  // ── H1 poll: always active — feeds the H1 macro alignment gate ──
+  // When swing mode is on, also triggers onH1Close() swing logic.
+  timers.push(setInterval(async () => {
+    if (shutting || h1Busy) return;
+    h1Busy = true;
+    try {
+      const newClose = await cs.update('H1');
+      if (newClose && cfg.swingEnabled) {
+        log.info('[Poll] H1 candle closed — running swing logic...');
+        await strategy.onH1Close();
       }
-    }, cfg.H1_POLL_MS));
+    } catch (e) {
+      if (!shutting) log.warn(`[H1 Poll] Error: ${e.message}`);
+    } finally {
+      h1Busy = false;
+    }
+  }, cfg.H1_POLL_MS));
 
+  // ── H4 poll: swing trend filter (only when SWING_ENABLED) ──
+  if (cfg.swingEnabled) {
     timers.push(setInterval(async () => {
       if (shutting || h4Busy) return;
       h4Busy = true;
@@ -186,6 +211,20 @@ async function main() {
     if (shutting) return;
     logStatus();
   }, 60_000));
+
+  // ── Labeler: run label_signals.py every 30 min throughout the day ──
+  // Keeps the labels table fresh so the nightly trainer always has
+  // up-to-date data.  Only runs when DB is configured.
+  if (cfg.DB_URL) {
+    let labelerBusy = false;
+    timers.push(setInterval(async () => {
+      if (shutting || labelerBusy) return;
+      labelerBusy = true;
+      try { await trainer.runLabeler(); }
+      finally { labelerBusy = false; }
+    }, 30 * 60_000));
+    log.info('[Main] Labeler scheduled every 30 min.');
+  }
 
   // Schedule UTC midnight daily reset
   scheduleMidnightReset();

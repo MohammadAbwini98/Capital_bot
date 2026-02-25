@@ -18,6 +18,10 @@ let _secToken     = null;
 let _accountId    = null;   // currentAccountId returned by POST /session
 let _refreshTimer = null;
 
+// ── Per-epic decimal precision cache ──────────────────────────
+// Populated lazily by getMarketInfo(); used by roundForEpic().
+const _epicDecimals = {};
+
 // ── Helpers ───────────────────────────────────────────────────
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -206,6 +210,7 @@ async function getCandles(epic, resolution, max = 200) {
 
 /**
  * Fetch current bid/ask and market status for an epic.
+ * Also caches the instrument's decimal precision for use in roundForEpic().
  * @returns {{ bid:number, ask:number, status:string }}
  *   status: 'TRADEABLE' | 'CLOSED' | 'EDITS_ONLY' | 'OFFLINE' | 'SUSPENDED' | ...
  */
@@ -215,7 +220,60 @@ async function getPrice(epic) {
     { headers: authHeaders() }
   );
   const s = res.data.snapshot;
+
+  // Cache decimal precision from instrument info if available
+  if (!(epic in _epicDecimals)) {
+    const factor = res.data.instrument?.decimalPlacesFactor;
+    if (factor && factor > 0) {
+      // decimalPlacesFactor = 10^n  →  n = log10(factor)
+      _epicDecimals[epic] = Math.round(Math.log10(factor));
+    } else {
+      // Default: 2 decimal places (safe for most CFDs)
+      _epicDecimals[epic] = 2;
+    }
+    log.debug(`[API] ${epic} precision: ${_epicDecimals[epic]} dp (factor=${factor})`);
+  }
+
   return { bid: s.bid, ask: s.offer, status: s.marketStatus ?? 'UNKNOWN' };
+}
+
+/**
+ * Round a price to the correct number of decimal places for this epic.
+ * Falls back to 2 dp if the cache has not been populated yet.
+ * @param {number} v
+ * @param {string} epic
+ * @returns {number}
+ */
+function roundForEpic(v, epic) {
+  const dp = _epicDecimals[epic] ?? 2;
+  return round(v, dp);
+}
+
+/**
+ * Recover realized PnL from activity history for a closed position.
+ * Returns null when no matching close event is found or the fetch fails.
+ *
+ * @param {string} dealId
+ * @param {number} openedTimeMs  Position open time (epoch ms) — used as `from` filter
+ * @returns {Promise<number|null>}
+ */
+async function recoverPnlFromHistory(dealId, openedTimeMs) {
+  try {
+    const activities = await getDayActivity(openedTimeMs);
+    const closeEvent = activities.find(a =>
+      a.dealId === dealId &&
+      (a.type?.toLowerCase()   === 'position') &&
+      (a.status?.toLowerCase() === 'closed')
+    );
+    if (closeEvent) {
+      const pnl = closeEvent.details?.profit ?? closeEvent.profit ?? null;
+      log.debug(`[API] History PnL for ${dealId}: ${pnl}`);
+      return typeof pnl === 'number' ? pnl : null;
+    }
+  } catch (e) {
+    log.debug(`[API] recoverPnlFromHistory failed for ${dealId}: ${e.message}`);
+  }
+  return null;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -274,8 +332,8 @@ async function createPosition({ epic, direction, size, stopLevel, profitLevel })
     direction,
     size,
     guaranteedStop: false,
-    stopLevel:   round(stopLevel),
-    profitLevel: round(profitLevel),
+    stopLevel:   roundForEpic(stopLevel, epic),
+    profitLevel: roundForEpic(profitLevel, epic),
   };
 
   log.trade(`[API] createPosition → ${direction} ${size} ${epic} | SL=${body.stopLevel} TP=${body.profitLevel}`);
@@ -345,10 +403,10 @@ async function closePosition(dealId) {
  * @param {string} dealId
  * @param {{ stopLevel?:number, profitLevel?:number }} updates
  */
-async function updatePosition(dealId, { stopLevel, profitLevel } = {}) {
+async function updatePosition(dealId, { stopLevel, profitLevel, epic = cfg.EPIC } = {}) {
   const body = {};
-  if (stopLevel   !== undefined) body.stopLevel   = round(stopLevel);
-  if (profitLevel !== undefined) body.profitLevel = round(profitLevel);
+  if (stopLevel   !== undefined) body.stopLevel   = roundForEpic(stopLevel,   epic);
+  if (profitLevel !== undefined) body.profitLevel = roundForEpic(profitLevel, epic);
 
   const res = await axios.put(
     `${cfg.baseUrl}/api/v1/positions/${dealId}`,
@@ -402,6 +460,7 @@ module.exports = {
   getPositions,
   getPosition,
   getDayActivity,
+  recoverPnlFromHistory,
   createPosition,
   closePosition,
   updatePosition,

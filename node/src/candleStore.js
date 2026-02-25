@@ -30,23 +30,29 @@ const TF_MS = {
 /**
  * Drop the last bar only if it is still forming.
  *
- * Capital.com's /prices endpoint may or may not include the current
- * in-progress bar as the last item — it is not guaranteed by the API.
- * Always slicing off the last bar permanently falls one candle behind
- * when the API returns only closed bars (newest.time never advances).
+ * Capital.com's /prices endpoint may include the current in-progress
+ * bar as the last item.  The snapshotTimeUTC field is the bar time key
+ * but its convention (open-time vs close-time) is not guaranteed.
  *
- * Fix: compare the last bar's expected close time against Date.now().
- * If the bar has already closed (with a 1-second cushion), keep it.
+ * This implementation handles both conventions:
+ *   • Open-time (bar.time = bar open):  elapsed = now - bar.time
+ *                                        forming when elapsed < TF_MS
+ *   • Close-time (bar.time = bar close): elapsed = now - bar.time
+ *                                        forming when elapsed < 0 (future)
+ *                                        → also caught by elapsed < TF_MS
  *
- * @param {'M5'|'M15'|'H1'|'H4'} tf
+ * A bar is considered "closed" when at least one full TF period has
+ * elapsed since its timestamp, i.e. elapsed >= TF_MS[tf].
+ *
+ * @param {'M1'|'M5'|'M15'|'H1'|'H4'} tf
  * @param {object[]} bars
  * @returns {object[]}
  */
 function dropInProgress(tf, bars) {
   if (!bars.length) return bars;
   const last      = bars[bars.length - 1];
-  const barEndMs  = last.time + TF_MS[tf];
-  const inProgress = Date.now() < barEndMs - 1_000;   // 1 s cushion
+  const elapsed   = Date.now() - last.time;
+  const inProgress = elapsed < TF_MS[tf];
   return inProgress ? bars.slice(0, -1) : bars;
 }
 
@@ -68,11 +74,13 @@ const store = { M1: [], M5: [], M15: [], H1: [], H4: [] };
 // Timestamp of the most recently processed closed bar per TF
 const lastClosedTime = { M1: 0, M5: 0, M15: 0, H1: 0, H4: 0 };
 
-// Active timeframes — M1 always included for micro-confirm; H1/H4 only with swing
+// Active timeframes.
+// H1 is always included even in scalp-only mode — used by the H1 macro alignment gate.
+// H4 is added only when swing mode is enabled (needed for trendFilterH4).
 function activeTFs() {
   return cfg.swingEnabled
     ? ['M1', 'M5', 'M15', 'H1', 'H4']
-    : ['M1', 'M5', 'M15'];
+    : ['M1', 'M5', 'M15', 'H1'];
 }
 
 // ── Startup history load ────────────────────────────────────────

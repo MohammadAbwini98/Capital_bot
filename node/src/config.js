@@ -69,26 +69,47 @@ const cfg = {
   SETUP_EXPIRY_BARS_SCALP:     6,      // 6 × M5 = 30 minutes
   SETUP_EXPIRY_BARS_SWING:     12,     // 12 × H1 = 12 hours
 
-  // ── Pullback / chop thresholds ────────────────────────────
-  PULLBACK_ATR_TOL:            0.40,   // EMA50 touch zone — spec value
-  CHOP_EMA_DIST_ATR_MIN:       0.12,   // min EMA spread to avoid chop
+  // ── Adaptive pullback / chop thresholds ──────────────────
+  // Tolerance for EMA50 touch grows with trend strength (spreadATR).
+  // When trend is strong enough, also allow EMA20 fast-pullback entries.
+  PULLBACK_TOL_BASE:           0.40,   // baseline ATR tolerance for EMA50 touch
+  PULLBACK_TOL_MAX:            0.70,   // maximum tolerance (caps widening)
+  PULLBACK_TOL_K:              1.20,   // how fast tolerance grows with spreadATR
+  FAST_PULLBACK_SPREADATR_MIN: 0.25,   // min spreadATR to enable EMA20 fast mode
+  FAST_PULLBACK_TOL:           0.35,   // ATR tolerance for EMA20 touch (tighter)
+  CHOP_EMA_DIST_ATR_MIN:       0.12,   // spreadATR floor — below this: no setups
   BIG_CANDLE_ATR_MAX:          1.50,   // skip trigger if range > 1.5× ATR
 
-  // ── Setup quality filters (both already active in code) ───
-  REQUIRE_EMA_ALIGNMENT_ON_SETUP: true,  // BUY: EMA20>EMA50; SELL: EMA20<EMA50
-  REQUIRE_REJECTION_CANDLE_SETUP: true,  // BUY: bullish bar; SELL: bearish bar
+  // ── Rejection candle quality ──────────────────────────────
+  // BUY:  close in top 40% of range  + lower wick ≥ 30% of range
+  // SELL: close in bottom 40% of range + upper wick ≥ 30% of range
+  REJECTION_CLOSE_PCT:         0.60,   // close position threshold (top/bottom 40%)
+  REJECTION_WICK_PCT:          0.30,   // minimum directional wick as fraction of range
 
   // ── BOS margin factor (already in code) ───────────────────
   BOS_MARGIN_ATR_FACTOR:       0.05,   // margin = max(spread, 0.05×ATR)
 
+  // ── Setup invalidation ────────────────────────────────────
+  SETUP_INVALIDATION_ATR:      0.15,   // kill setup if price breaks EMA50 by this×ATR
+
   // ── SL / TP ───────────────────────────────────────────────
-  SL_BUFFER_ATR:               0.15,   // buffer beyond pullback extreme
+  SL_BUFFER_ATR:               0.10,   // buffer beyond pullback extreme (was 0.15)
+  // Scalp: fixed ATR multiples — stable across volatility regimes
+  SCALP_TP1_ATR:               0.80,   // TP1 = entry ± 0.8×ATR
+  SCALP_TP2_ATR:               1.60,   // TP2 = entry ± 1.6×ATR
+  // Swing: R-multiple targets (unchanged)
   TP1_R:                       1.0,    // TP1 at 1R
-  TP2_R_SCALP:                 2.0,    // TP2 at 2R (scalp)
   TP2_R_SWING:                 3.0,    // TP2 at 3R (swing)
   PARTIAL_CLOSE_TP1:           0.50,   // close 50% at TP1
   MOVE_SL_TO_BREAKEVEN_ON_TP1: false,
   TP1_MIN_DISTANCE_SPREAD_MULT: 2.0,   // skip if |TP1-entry| < 2×spread
+
+  // ── Volatility floor (Gold-specific) ─────────────────────
+  ATR_ABS_MIN_M5:              1.50,   // absolute minimum M5 ATR14 for Gold
+
+  // ── Dynamic spread limit ──────────────────────────────────
+  SPREAD_ATR_FACTOR:           0.10,   // dynamic max = max(SPREAD_MIN_GOLD, factor×ATR)
+  SPREAD_MIN_GOLD:             0.25,   // minimum spread threshold for dynamic check
 
   // ── M1 micro-confirmation ─────────────────────────────────
   // Applied just before placing a SCALP entry (after BOS triggers).
@@ -98,9 +119,37 @@ const cfg = {
   MICRO_EMA_FAST_PERIOD:  20,
   MICRO_EMA_SLOW_PERIOD:  50,
 
+  // ── M5 momentum gate (RSI) ────────────────────────────────
+  // Applied after BOS is detected. Avoids entering exhausted momentum.
+  RSI_PERIOD:           14,
+  M5_RSI_BUY_MIN:       52,    // BUY only if M5 RSI14 >= 52
+  M5_RSI_SELL_MAX:      48,    // SELL only if M5 RSI14 <= 48
+
+  // ── M5 volatility regime gate (ATR ratio) ─────────────────
+  // Avoids entries in dead/compressed markets.
+  ATR_RATIO_SMA_PERIOD: 50,    // compare current ATR to SMA(ATR, 50)
+  ATR_RATIO_MIN:        0.80,  // require ATR ratio >= 0.80
+
+  // ── M5 breakout quality gate (candle body) ────────────────
+  // BOS trigger bar body must be >= 30% of ATR (filters micro-wick BOS).
+  BOS_CANDLE_BODY_ATR_MIN: 0.30,
+
+  // ── M15 trend quality gates ───────────────────────────────
+  M15_TREND_STRENGTH_MIN:  0.80,  // |close - EMA200| / ATR14_M15 >= 0.80
+  M15_EMA200_SLOPE_BARS:   10,    // bars over which to measure EMA200 slope
+  M15_ATR_PERIOD:          14,    // ATR period for M15-level calculations
+
+  // ── H1 macro alignment filter ─────────────────────────────
+  // Scalp BUY only when H1 close > H1 EMA200; RSI not overbought/oversold.
+  H1_RSI_OVERBOUGHT:    68,  // BUY blocked if H1 RSI14 > 68
+  H1_RSI_OVERSOLD:      32,  // SELL blocked if H1 RSI14 < 32
+
   // ── Candle store settings ─────────────────────────────────
   HISTORY_BARS:    300,   // bars loaded at startup for H1/H4 (need ≥200 for EMA200)
   INCREMENTAL_BARS: 6,    // bars fetched per incremental update
+
+  // ── Quote storage ─────────────────────────────────────────
+  QUOTE_FLUSH_MS:  60_000,  // flush buffered bid/ask ticks to DB every 60 s
 
   // ── Poll intervals (ms) ───────────────────────────────────
   TICK_POLL_MS: 5_000,    // position management / bid-ask check
@@ -118,6 +167,12 @@ const cfg = {
   // Leave blank to disable notifications silently.
   telegramToken:  process.env.TELEGRAM_TOKEN   || '',
   telegramChatId: process.env.TELEGRAM_CHAT_ID || '',
+
+  // ── Timezone for Telegram message timestamps ──────────────
+  // Use any IANA timezone name, e.g. 'Asia/Riyadh' (UTC+3),
+  // 'Europe/London', 'America/New_York', etc.
+  // Set TIMEZONE in .env to override.
+  TIMEZONE: process.env.TIMEZONE || 'Asia/Riyadh',
 
   // ── Database (optional — ML data logging) ─────────────────
   // Set DB_URL in .env to enable signal/candle/trade persistence.

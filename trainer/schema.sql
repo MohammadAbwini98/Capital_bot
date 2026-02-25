@@ -66,7 +66,22 @@ CREATE TABLE IF NOT EXISTS labels (
   computed_at   TIMESTAMPTZ      DEFAULT NOW()
 );
 
+-- ── Quotes (live bid/ask ticks, flushed every ~60 s) ──────────
+-- Useful for spread analysis, slippage studies, and offline replay.
+-- Batched inserts keep DB write pressure negligible.
+CREATE TABLE IF NOT EXISTS quotes (
+  epic   TEXT             NOT NULL,
+  ts     BIGINT           NOT NULL,   -- epoch ms
+  bid    DOUBLE PRECISION NOT NULL,
+  ask    DOUBLE PRECISION NOT NULL,
+  spread DOUBLE PRECISION NOT NULL,
+  status TEXT,
+  PRIMARY KEY (epic, ts)
+);
+CREATE INDEX IF NOT EXISTS quotes_epic_ts ON quotes (epic, ts DESC);
+
 -- ── Model registry ────────────────────────────────────────────
+-- status: 'champion' (active), 'challenger' (shadow), 'archived'
 CREATE TABLE IF NOT EXISTS model_registry (
   id            BIGSERIAL    PRIMARY KEY,
   model_version TEXT         NOT NULL UNIQUE,
@@ -74,5 +89,40 @@ CREATE TABLE IF NOT EXISTS model_registry (
   n_train       INT,
   accuracy      DOUBLE PRECISION,
   roc_auc       DOUBLE PRECISION,
-  notes         TEXT
+  notes         TEXT,
+  status        TEXT         NOT NULL DEFAULT 'challenger',
+  promoted_at   TIMESTAMPTZ
 );
+CREATE INDEX IF NOT EXISTS model_registry_status ON model_registry (status);
+
+-- ── Training runs ──────────────────────────────────────────────
+-- One row per execution of train.py — audit trail for every fit.
+CREATE TABLE IF NOT EXISTS training_runs (
+  id             BIGSERIAL        PRIMARY KEY,
+  model_version  TEXT             NOT NULL,
+  started_at     TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+  finished_at    TIMESTAMPTZ,
+  n_train        INT,
+  n_val          INT,
+  train_start_ts BIGINT,
+  train_end_ts   BIGINT,
+  cv_roc_auc     DOUBLE PRECISION,
+  val_hit_rate   DOUBLE PRECISION,
+  promoted       BOOLEAN          NOT NULL DEFAULT FALSE,
+  notes          TEXT
+);
+
+-- ── Predictions ────────────────────────────────────────────────
+-- One row per model scoring event (champion + challenger shadow).
+-- Enables offline comparison of champion vs challenger before promotion.
+CREATE TABLE IF NOT EXISTS predictions (
+  id        BIGSERIAL        PRIMARY KEY,
+  signal_id BIGINT           REFERENCES signals(id) ON DELETE CASCADE,
+  model_id  TEXT             NOT NULL,    -- model_version string
+  p_win     DOUBLE PRECISION NOT NULL,    -- model output probability
+  acted     BOOLEAN          NOT NULL DEFAULT FALSE,  -- trade placed on this score?
+  shadow    BOOLEAN          NOT NULL DEFAULT FALSE,  -- TRUE = challenger shadow score
+  ts        BIGINT           NOT NULL
+);
+CREATE INDEX IF NOT EXISTS predictions_signal_id ON predictions (signal_id);
+CREATE INDEX IF NOT EXISTS predictions_model_ts  ON predictions (model_id, ts DESC);
